@@ -304,7 +304,7 @@ class Runtime:
                 self.radio["state"] = "idle"
 
 
-def create_app(data_dir=None):
+def create_app(data_dir=None, api_token=None):
     root = Path(data_dir or os.getenv("ACC_ENGINEER_DATA", Path(os.getenv("LOCALAPPDATA", ".")) / "ACC Race Engineer"))
     runtime = Runtime(root)
 
@@ -320,6 +320,13 @@ def create_app(data_dir=None):
 
     @app.middleware("http")
     async def local_only(request: Request, call_next):
+        if api_token:
+            import hmac
+            supplied = request.headers.get("x-acc-token", "")
+            if request.url.path.startswith("/api/audio/"):
+                supplied = supplied or request.query_params.get("access_token", "")
+            if request.headers.get("origin") or not hmac.compare_digest(supplied, api_token):
+                return JSONResponse({"detail": "Native app authentication required"}, 403)
         host = request.headers.get("host", "").split(":")[0]
         origin = request.headers.get("origin")
         if host not in {"localhost", "127.0.0.1", "testserver"}:
