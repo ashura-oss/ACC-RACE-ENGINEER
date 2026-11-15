@@ -6,9 +6,11 @@ import time
 from pathlib import Path
 
 
+DEFAULT_ENGINEER_VOICE = "bf322df2096a46f18c579d0baa36f41d"
+
 DEFAULTS = {
     "model": "deepseek/deepseek-v4.1-flash", "speech_model": "fish-audio/drama-3",
-    "voice": "", "weekly_budget_usd": 5.0, "request_limit_usd": 0.10,
+    "voice": DEFAULT_ENGINEER_VOICE, "weekly_budget_usd": 5.0, "request_limit_usd": 0.10,
     "speech_speed": 1.0, "volume": 0.8, "commentary_frequency": "normal",
     "radio_button": "R3", "keyboard_binding": "<f9>", "follow_up_listening": False,
     "recording_timeout_s": 30, "stale_after_s": 2.0,

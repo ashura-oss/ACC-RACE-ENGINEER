@@ -118,7 +118,9 @@ def test_critical_event_kinds_resolve_approved_clips(tmp_path, monkeypatch):
         async def exercise():
             for event_kind, clip_id in cases:
                 clip = runtime.store.clip(clip_id)
-                clip["versions"] = [{"id": "approved-" + clip_id, "approved": True}]
+                from acc_engineer.providers import voice_identity
+                clip["versions"] = [{"id": "approved-" + clip_id, "approved": True,
+                                     "text": clip["text"], **voice_identity(runtime.store.settings())}]
                 runtime.store.put_clip(clip)
                 await runtime.announce({"kind": event_kind, "priority": 0})
         asyncio.run(exercise())

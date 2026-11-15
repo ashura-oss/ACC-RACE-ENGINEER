@@ -124,7 +124,7 @@ def test_settings_voice_test_clarifies_it_uses_saved_settings(window):
     instance, _api = window
     page = instance.pages["AI settings"]
     assert page.voice_test_button.text() == "Test engineer voice"
-    assert page.voice.placeholderText() == "Leave blank for Fish default voice"
+    assert "Adrian" in page.voice.placeholderText()
     assert any("Save settings before testing changes" in label.text()
                for label in page.findChildren(QWidget) if hasattr(label, "text"))
 

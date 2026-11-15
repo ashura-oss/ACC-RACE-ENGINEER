@@ -41,7 +41,7 @@ The model has six read-only race-data tools for tyre status, fuel projection, co
 
 Configure an OpenRouter API key in the app's AI settings. The key is stored with Windows Credential Manager through `keyring`, not in the SQLite settings database. Alternatively, set `OPENROUTER_API_KEY` in the process environment; environment credentials take precedence. Do not put credentials in project files or commit them.
 
-The default text model is `deepseek/deepseek-v4.1-flash`. The default speech model is `fish-audio/drama-3`; leave Voice ID blank to use Fish's default voice, or enter a supported reference voice ID. These model identifiers and the speech endpoint were checked against the live OpenRouter model/endpoint catalogue during this release's preparation; availability, pricing and provider behavior can change. Requests are blocked when model pricing is unavailable or when the configured per-request/weekly local expenditure limits would be exceeded. Provider-reported billing is authoritative; local bounds are conservative estimates. See [provider details](docs/PROVIDERS.md).
+The default text model is `deepseek/deepseek-v4.1-flash`. The default speech model is `fish-audio/drama-3`; the engineer is pinned to Fish Official Adrian by a fixed voice ID, including when the field is blank. Enter another supported voice ID to deliberately change the engineer. These model identifiers and the speech endpoint were checked against the live OpenRouter model/endpoint catalogue during this release's preparation; availability, pricing and provider behavior can change. Requests are blocked when model pricing is unavailable or when the configured per-request/weekly local expenditure limits would be exceeded. Provider-reported billing is authoritative; local bounds are conservative estimates. See [provider details](docs/PROVIDERS.md).
 
 For microphone push-to-talk, install the `radio` extra. For screenshot analysis, install `vision` with `python -m pip install -e ".[vision]"`. The first local faster-whisper transcription downloads the selected model (currently `base.en`) to the local model cache. Recording is explicit and bounded. Follow-up automatic listening is unavailable; the backend rejects settings that enable it, so use the configured push-to-talk control.
 
@@ -51,7 +51,7 @@ For microphone push-to-talk, install the `radio` extra. For screenshot analysis,
 .\.venv\Scripts\python.exe -m pytest
 ```
 
-The GitHub Actions workflow runs pytest on Windows with Python 3.11 and 3.13. The current suite has 91 passing tests, including native Qt interaction and backend lifecycle tests. Tests do not establish live ACC acceptance or performance.
+The GitHub Actions workflow runs pytest on Windows with Python 3.11 and 3.13. The current suite has 100 passing tests, including native Qt interaction and backend lifecycle tests. Tests do not establish live ACC acceptance or performance.
 
 To build a standalone folder distribution, run `.Build-Engineer.ps1`. Launch `dist\ACC-Race-Engineer\ACC-Race-Engineer.exe`; it opens the native desktop app and starts its local backend. This PyInstaller build has not been validated on a clean Windows machine.
 

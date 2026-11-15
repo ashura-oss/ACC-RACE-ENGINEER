@@ -49,8 +49,11 @@ def test_real_wav_is_preserved():
     assert speech_to_wav(wav_data, "audio/wav") == wav_data
 
 
-@pytest.mark.parametrize("voice", ["", "engineer-voice-7"])
-def test_speech_request_uses_pcm_and_only_sends_explicit_voice(tmp_path, voice):
+PINNED_VOICE = "bf322df2096a46f18c579d0baa36f41d"
+
+
+@pytest.mark.parametrize("voice,expected", [("", PINNED_VOICE), ("engineer-voice-7", "engineer-voice-7")])
+def test_speech_request_uses_pcm_and_pinned_or_explicit_voice(tmp_path, voice, expected):
     store = Store(tmp_path)
     provider = OpenRouter(store)
     store.save_settings({"voice": voice})
@@ -70,9 +73,53 @@ def test_speech_request_uses_pcm_and_only_sends_explicit_voice(tmp_path, voice):
         wav_data = asyncio.run(provider.speech("Test radio call."))
         assert sent["endpoint"] == "/audio/speech"
         assert sent["payload"]["response_format"] == "pcm"
-        assert sent["payload"].get("voice") == (voice or None)
+        assert sent["payload"]["voice"] == expected
         with wave.open(io.BytesIO(wav_data), "rb") as recording:
             assert recording.getframerate() == 24000
+    finally:
+        asyncio.run(provider.client.aclose())
+        store.close()
+
+
+def test_repeated_speech_texts_always_send_same_resolved_voice(tmp_path):
+    store = Store(tmp_path)
+    provider = OpenRouter(store)
+    sent = []
+
+    async def fake_post(model, endpoint, payload, **kwargs):
+        sent.append(payload.copy())
+
+        class Response:
+            content = b"\x00\x00" * 4
+            headers = {"content-type": "audio/pcm; rate=24000; channels=1"}
+
+        return Response()
+
+    provider._post = fake_post
+    try:
+        asyncio.run(provider.speech("First call."))
+        asyncio.run(provider.speech("Different words, same engineer."))
+        assert [payload["voice"] for payload in sent] == [PINNED_VOICE, PINNED_VOICE]
+    finally:
+        asyncio.run(provider.client.aclose())
+        store.close()
+
+
+def test_provider_rejection_of_pinned_voice_is_not_retried_with_fallback(tmp_path):
+    store = Store(tmp_path)
+    provider = OpenRouter(store)
+    attempts = []
+
+    async def reject(model, endpoint, payload, **kwargs):
+        attempts.append(payload.copy())
+        raise ProviderError("OpenRouter returned HTTP 400.")
+
+    provider._post = reject
+    try:
+        with pytest.raises(ProviderError):
+            asyncio.run(provider.speech("Pinned voice request."))
+        assert len(attempts) == 1
+        assert attempts[0]["voice"] == PINNED_VOICE
     finally:
         asyncio.run(provider.client.aclose())
         store.close()

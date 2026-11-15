@@ -8,6 +8,12 @@ import wave
 from email.message import Message
 
 import httpx
+from .storage import DEFAULT_ENGINEER_VOICE
+
+
+def voice_identity(settings):
+    return {"voice": (settings.get("voice") or "").strip() or DEFAULT_ENGINEER_VOICE,
+            "speech_model": settings.get("speech_model", "fish-audio/drama-3")}
 
 SYSTEM = """You are a professional ACC race engineer. Calm, concise, competitive, supportive
 after incidents, occasional dry humour. Answer in at most three short radio sentences.
@@ -152,14 +158,13 @@ class OpenRouter:
 
     async def speech(self, text):
         settings = self.store.settings()
-        payload = {"model": settings["speech_model"], "input": text,
+        identity = voice_identity(settings)
+        payload = {"model": identity["speech_model"], "input": text, "voice": identity["voice"],
                    "response_format": "pcm", "speed": settings["speech_speed"]}
-        # Fish accepts its provider default voice when no ID is supplied. Never
-        # invent a voice identifier or block the supported default unnecessarily.
-        if settings["voice"].strip():
-            payload["voice"] = settings["voice"].strip()
+        # Every request pins one speaker. Do not silently retry with a random
+        # provider voice if that speaker is unavailable or rejected.
         if settings["speech_model"].startswith("fish-audio/"):
-            payload["instructions"] = "A calm professional British male motorsport race engineer. Clear natural radio delivery."
+            payload["instructions"] = "A professional motorsport race engineer. Preserve the selected speaker identity. Clear natural radio delivery."
         response = await self._post(settings["speech_model"], "/audio/speech", payload)
         return speech_to_wav(response.content, response.headers.get("content-type", ""))
 

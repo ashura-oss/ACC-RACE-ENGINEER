@@ -8,12 +8,12 @@ The native process owns a private ephemeral loopback backend with a per-instance
 authentication token. Closing the window stops that backend and radio services.
 The native tests cover page construction, live status, controls, library layout,
 credential clearing, authenticated requests and real backend startup/shutdown.
-The complete local suite currently passes 91 tests. The source application was
+The complete local suite currently passes 100 tests. The source application was
 also checked interactively for start, stop, library navigation and clean close.
 
 ## What is covered
 
-The current pytest suite has 91 passing tests covering native UI behavior, deterministic calculations, application/API behavior with test fixtures, setup file safety, screenshot-capture guards, model-tool behavior and synthetic telemetry/protocol inputs. CI runs the suite on Windows with Python 3.11 and 3.13. This is software-level coverage only.
+The current pytest suite has 100 passing tests covering native UI behavior, deterministic calculations, application/API behavior with test fixtures, setup file safety, screenshot-capture guards, model-tool behavior and synthetic telemetry/protocol inputs. CI runs the suite on Windows with Python 3.11 and 3.13. This is software-level coverage only.
 
 A PyInstaller Windows folder build was previously exercised through the legacy dashboard routes and passed start/stop API smoke checks (HTTP 200). That historical check does not validate the native window, current packaged UI, clean-machine installation, or game compatibility.
 
@@ -48,3 +48,7 @@ The six model tools are read-only and return unknown when fresh data is unavaila
 ## Speech repair validation
 
 A live Fish Drama 3 default-voice request returned PCM at 44.1 kHz mono. It was wrapped into WAV using the response metadata. A normalized copy of the known generated phrase was correctly transcribed locally as Radio Check, Engineer online. The local base.en recognition model is cached. All 27 standard radio recordings were generated locally for driver review; none were automatically approved. These checks used generated speech, not live microphone input.
+
+## Fixed engineer voice
+
+The selected identity is Fish Official Adrian (bf322df2096a46f18c579d0baa36f41d). Two live speech requests with different text succeeded using that explicit ID. All 27 library scripts were regenerated with the same voice and speech model; previous versions were retained and deapproved. New versions require driver review. Cached playback and approval reject mismatched voice/model/script metadata, and missing critical recordings are shown in the native overview. No claim is made that natural speech prosody is identical across utterances.

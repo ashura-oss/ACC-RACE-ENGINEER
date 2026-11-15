@@ -20,6 +20,9 @@ from PySide6.QtWidgets import (
 )
 
 
+DEFAULT_ENGINEER_VOICE_ID = "bf322df2096a46f18c579d0baa36f41d"
+
+
 def _pretty(value):
     return json.dumps(value, indent=2, ensure_ascii=False, default=str)
 
@@ -124,6 +127,10 @@ class OverviewPage(Page):
         self.summary.setWordWrap(True)
         self.summary.setObjectName("statusCard")
         self.body.addWidget(self.summary)
+        self.critical_audio = QLabel()
+        self.critical_audio.setWordWrap(True)
+        self.critical_audio.setStyleSheet("color: #ff9e73;")
+        self.body.addWidget(self.critical_audio)
         _, chat = self.group("Ask the engineer")
         chat_row = QHBoxLayout()
         self.chat_input = QLineEdit(); self.chat_input.setPlaceholderText("Ask about the current race…")
@@ -161,6 +168,8 @@ class OverviewPage(Page):
 
     def on_status(self):
         s = self.status; t = s.get("telemetry") or {}; age = s.get("telemetry_age_s")
+        missing = (s.get("audio_readiness") or {}).get("missing_critical", [])
+        self.critical_audio.setText("Critical warnings need review for this voice: " + ", ".join(missing) if missing else "")
         fresh = s.get("source") == "acc" and t.get("status") == "live" and age is not None and age < 2
         self.summary.setText(f"{'ENGINEER RUNNING' if s.get('running') else 'ENGINEER STOPPED'}   ·   {s.get('source', 'disconnected')} source   ·   {'LIVE' if fresh else 'NO FRESH TELEMETRY'}")
         self.start_btn.setEnabled(not s.get("running", False))
@@ -223,11 +232,11 @@ class LibraryPage(Page):
         row = QHBoxLayout()
         row.addWidget(self.button("Save script", self._save)); row.addWidget(self.button("Generate speech", self._generate, True))
         layout.addLayout(row)
-        self.versions = QTableWidget(0, 3); self.versions.setHorizontalHeaderLabels(["Version", "Status", "Created"])
+        self.versions = QTableWidget(0, 5); self.versions.setHorizontalHeaderLabels(["Version", "Status", "Voice ID", "Speech model", "Created"])
         self.versions.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows); self.versions.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.versions.itemSelectionChanged.connect(self._select_version)
         layout.addWidget(self.versions, 1)
-        actions = QHBoxLayout(); actions.addWidget(self.button("Preview selected", self._play, True)); actions.addWidget(self.button("Approve / reject", self._toggle_approval)); actions.addWidget(self.button("Delete version", self._delete_version, True)); layout.addLayout(actions)
+        actions = QHBoxLayout(); actions.addWidget(self.button("Preview selected", self._play, True)); self.approve_button = self.button("Approve / reject", self._toggle_approval); actions.addWidget(self.approve_button); actions.addWidget(self.button("Delete version", self._delete_version, True)); layout.addLayout(actions)
         self.audio_output = QAudioOutput(self); self.player = QMediaPlayer(self); self.player.setAudioOutput(self.audio_output)
         split.addWidget(right)
         split.setStretchFactor(0, 1)
@@ -278,12 +287,27 @@ class LibraryPage(Page):
         self.script.setPlainText(clip.get("text", "")); self.versions.setRowCount(0)
         for version in reversed(clip.get("versions", [])):
             row = self.versions.rowCount(); self.versions.insertRow(row)
-            for col, value in enumerate((version.get("id", "")[:12], "Approved" if version.get("approved") else "Needs review", _time(version.get("timestamp")))):
+            matches_voice = version.get("matches_voice", True)
+            if not matches_voice:
+                status = "Previous voice · approved" if version.get("approved") else "Previous voice"
+            else:
+                status = "Approved" if version.get("approved") else "Needs review"
+            voice_id = version.get("voice", "")
+            speech_model = version.get("speech_model", "")
+            values = (version.get("id", "")[:12], status, voice_id, speech_model,
+                      _time(version.get("timestamp")))
+            for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value)); item.setData(Qt.ItemDataRole.UserRole, version); self.versions.setItem(row, col, item)
+                if col in (2, 3) and value:
+                    item.setToolTip(str(value))
         if self.versions.rowCount(): self.versions.selectRow(0)
 
     def _select_version(self):
         rows = self.versions.selectedItems(); self.version = rows[0].data(Qt.ItemDataRole.UserRole) if rows else None
+        if hasattr(self, "approve_button"):
+            enabled = bool(self.version and self.version.get("matches_voice", True))
+            self.approve_button.setEnabled(enabled)
+            self.approve_button.setToolTip("Generate a version for the current voice before approving this recording." if self.version and not enabled else "")
 
     def _clip_path(self, suffix=""):
         return f"/api/library/{quote(str(self.current['id']), safe='')}{suffix}"
@@ -301,7 +325,7 @@ class LibraryPage(Page):
         if self.current: self.request("POST", self._clip_path("/generate"), {}, self._after_clip)
 
     def _toggle_approval(self):
-        if self.current and self.version:
+        if self.current and self.version and self.version.get("matches_voice", True):
             self.request("POST", self._clip_path("/approve"), {"version_id": self.version["id"], "approved": not self.version.get("approved", False)}, self._after_clip)
 
     def _delete_version(self):
@@ -432,7 +456,7 @@ class SettingsPage(Page):
         self.setup_root = QLineEdit(); browse = QPushButton("Browse…"); browse.clicked.connect(self._browse_setup); root_row = QHBoxLayout(); root_row.addWidget(self.setup_root); root_row.addWidget(browse)
         self.thresholds = QTextEdit(); self.thresholds.setMaximumHeight(120)
         self.profiles = QTextEdit(); self.profiles.setMaximumHeight(140)
-        self.form.addRow("Reasoning model", self.model); self.form.addRow("Speech model", self.speech_model); self.form.addRow("Voice ID (optional)", self.voice)
+        self.form.addRow("Reasoning model", self.model); self.form.addRow("Speech model", self.speech_model); self.form.addRow("Engineer voice ID", self.voice)
         self.form.addRow("Weekly budget (USD)", self.budget); self.form.addRow("Per-request limit (USD)", self.limit); self.form.addRow("Speech speed", self.speed); self.form.addRow("Playback volume", self.volume)
         self.form.addRow("Commentary frequency", self.frequency); self.form.addRow("Recording timeout (seconds)", self.timeout); self.form.addRow("Telemetry stale threshold (seconds)", self.stale)
         self.form.addRow("Broadcast port", self.port); self.form.addRow("Broadcast password", self.broadcast_password); self.form.addRow("Broadcast", self.broadcast_enabled)
@@ -442,7 +466,7 @@ class SettingsPage(Page):
         self.key = QLineEdit(); self.key.setEchoMode(QLineEdit.EchoMode.Password); self.key.setPlaceholderText("sk-or-…"); self.form.insertRow(3, "OpenRouter API key", self.key)
         self.api_state = QLabel("Key status: checking…"); self.form.addRow("Credential status", self.api_state)
         self.settings = {}
-        self.voice.setPlaceholderText("Leave blank for Fish default voice")
+        self.voice.setPlaceholderText("Blank uses fixed Adrian voice")
         self.voice_test_player = QMediaPlayer(self)
         self.voice_test_output = QAudioOutput(self)
         self.voice_test_player.setAudioOutput(self.voice_test_output)
@@ -452,7 +476,7 @@ class SettingsPage(Page):
         self.prepare_speech_button.clicked.connect(self._prepare_speech)
         voice_actions = QHBoxLayout(); voice_actions.addWidget(self.voice_test_button); voice_actions.addWidget(self.prepare_speech_button)
         self.form.addRow("Speech tools", voice_actions)
-        voice_hint = QLabel("Voice test uses saved settings. Save settings before testing changes.")
+        voice_hint = QLabel(f"Blank voice ID uses fixed Fish Official Adrian ({DEFAULT_ENGINEER_VOICE_ID}); speech identity stays stable across generated clips. Voice test uses saved settings. Save settings before testing changes.")
         voice_hint.setWordWrap(True)
         voice_hint.setObjectName("mutedText")
         self.form.addRow("", voice_hint)
@@ -537,7 +561,7 @@ class SettingsPage(Page):
             self.speech_status.setText(detail)
 
     def _values(self):
-        return {"model":self.model.text().strip(),"speech_model":self.speech_model.text().strip(),"voice":self.voice.text(),
+        return {"model":self.model.text().strip(),"speech_model":self.speech_model.text().strip(),"voice":self.voice.text().strip() or DEFAULT_ENGINEER_VOICE_ID,
             "weekly_budget_usd":self.budget.value(),"request_limit_usd":self.limit.value(),"speech_speed":self.speed.value(),"volume":self.volume.value(),
             "commentary_frequency":self.frequency.currentText(),"recording_timeout_s":self.timeout.value(),"stale_after_s":self.stale.value(),
             "broadcast_port":self.port.value(),"broadcast_enabled":self.broadcast_enabled.isChecked(),"setup_root":self.setup_root.text().strip(),

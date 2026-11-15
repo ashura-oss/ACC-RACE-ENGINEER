@@ -16,7 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .audio import AudioScheduler, apply_volume, seed_library
 from .engineering import EventEngine
-from .providers import OpenRouter, ProviderError
+from .providers import OpenRouter, ProviderError, voice_identity
 from .setups import SetupManager
 from .storage import DEFAULTS, Store
 from .telemetry import AccSharedMemory, BroadcastingClient
@@ -58,6 +58,8 @@ class Chat(BaseModel):
 class Runtime:
     def __init__(self, root):
         self.store = Store(root)
+        if not self.store.settings()["voice"].strip():
+            self.store.save_settings({"voice": voice_identity(self.store.settings())["voice"]})
         if self.store.settings()["recording_timeout_s"] > 30:
             self.store.save_settings({"recording_timeout_s": 30})
         seed_library(self.store)
@@ -105,6 +107,9 @@ class Runtime:
         if self.running:
             return
         self.running = True
+        missing = self.audio_readiness()["missing_critical"]
+        if missing:
+            self.error("Critical radio audio needs review for the selected voice: " + ", ".join(missing))
         self.generation += 1
         self.engine = EventEngine(self.store.settings()["thresholds"])
         self.tasks = [asyncio.create_task(self.poll()), asyncio.create_task(self.audio.run())]
@@ -206,7 +211,10 @@ class Runtime:
                    "minor_damage": "damage_minor", "tyres_hot": "tyre_hot", "brakes_hot": "brake_hot"}.get(event["kind"], event["kind"])
         clip = self.store.clip(clip_id)
         if clip:
-            version = next((v for v in reversed(clip["versions"]) if v["approved"]), None)
+            identity = voice_identity(self.store.settings())
+            version = next((v for v in reversed(clip["versions"]) if v["approved"] and
+                v.get("voice") == identity["voice"] and v.get("speech_model") == identity["speech_model"] and
+                v.get("text") == clip["text"]), None)
             if version:
                 if event["priority"] == 0:
                     await self.cancel_radio()
@@ -214,6 +222,20 @@ class Runtime:
                                    event["priority"], session=self.audio.session)
                 return
         self.store.add("playback", {"outcome": "missing_approved_clip", "event": event["kind"]})
+
+    def audio_readiness(self):
+        identity = voice_identity(self.store.settings())
+        missing = []
+        for clip in self.store.clips():
+            if clip.get("priority") != 0:
+                continue
+            valid = any(version.get("approved") and version.get("text") == clip["text"] and
+                all(version.get(key) == value for key, value in identity.items()) and
+                (self.store.root / "audio" / (version["id"] + ".wav")).is_file()
+                for version in clip["versions"])
+            if not valid:
+                missing.append(clip["id"])
+        return {"ready": not missing, "missing_critical": missing, **identity}
 
     def context(self, message=""):
         frame = self.telemetry or {}
@@ -380,7 +402,7 @@ def create_app(data_dir=None, api_token=None):
         frame = runtime.telemetry
         return {"running": runtime.running, "muted": runtime.audio.muted,
             "telemetry": frame, "telemetry_age_s": time.time()-frame["timestamp"] if frame else None,
-            "source": runtime.source, "radio": runtime.radio, "provider": {
+            "source": runtime.source, "radio": runtime.radio, "audio_readiness": runtime.audio_readiness(), "provider": {
                 "model": runtime.store.settings()["model"], "speech_model": runtime.store.settings()["speech_model"],
                 "key_configured": bool(runtime.provider.key()), "configured": bool(runtime.provider.key())}, "spend_usd": runtime.store.spend(),
             "errors": runtime.errors, "broadcast": runtime.broadcast.snapshot() if runtime.broadcast else None,
@@ -414,6 +436,8 @@ def create_app(data_dir=None, api_token=None):
         if runtime.running:
             raise ValueError("Stop the engineer before changing settings.")
         values = body.model_dump(exclude_unset=True)
+        if "voice" in values:
+            values["voice"] = voice_identity(runtime.store.settings() | values)["voice"]
         if values.get("follow_up_listening"):
             raise ValueError("Automatic follow-up listening is not enabled in this release; use R3.")
         if values.get("broadcast_password") == "":
@@ -460,7 +484,12 @@ def create_app(data_dir=None, api_token=None):
 
     @app.get("/api/library")
     async def library():
-        return runtime.store.clips()
+        clips = runtime.store.clips()
+        identity = voice_identity(runtime.store.settings())
+        for clip in clips:
+            for version in clip["versions"]:
+                version["matches_voice"] = all(version.get(key) == value for key, value in identity.items())
+        return clips
 
     def require_clip(clip_id):
         clip = runtime.store.clip(clip_id)
@@ -484,12 +513,13 @@ def create_app(data_dir=None, api_token=None):
     @app.post("/api/library/{clip_id}/generate")
     async def generate_clip(clip_id: str):
         clip = require_clip(clip_id)
+        identity = voice_identity(runtime.store.settings())
         data = await runtime.provider.speech(clip["text"])
         version_id = uuid.uuid4().hex
         (runtime.store.root / "audio" / (version_id+".wav")).write_bytes(apply_volume(data, runtime.store.settings()["volume"]))
         latest = require_clip(clip_id)
         latest["versions"].append({"id": version_id, "approved": False, "text": clip["text"],
-            "voice": runtime.store.settings()["voice"], "timestamp": time.time(), "url": "/api/audio/"+version_id})
+            **identity, "timestamp": time.time(), "url": "/api/audio/"+version_id})
         runtime.store.put_clip(latest)
         return latest
 
@@ -499,6 +529,10 @@ def create_app(data_dir=None, api_token=None):
         version = next((v for v in clip["versions"] if v["id"] == body.get("version_id")), None)
         if not version:
             raise HTTPException(404, "Version not found")
+        if body.get("approved", True):
+            identity = voice_identity(runtime.store.settings())
+            if any(version.get(key) != value for key, value in identity.items()):
+                raise ValueError("Recording uses a previous voice or speech model. Generate the current engineer voice first.")
         version["approved"] = bool(body.get("approved", True))
         if version["approved"] and version["text"] != clip["text"]:
             raise ValueError("Recording script differs from current script. Regenerate it.")
