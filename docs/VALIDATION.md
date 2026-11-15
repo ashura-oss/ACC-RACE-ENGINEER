@@ -2,7 +2,9 @@
 
 ## What is covered
 
-The current pytest suite has 54 passing tests covering deterministic calculations, application/API behavior with test fixtures, setup file safety, screenshot-capture guards, model-tool behavior and synthetic telemetry/protocol inputs. CI runs the suite on Windows with Python 3.11 and 3.13. This is software-level coverage only.
+The current pytest suite has 58 passing tests covering deterministic calculations, application/API behavior with test fixtures, setup file safety, screenshot-capture guards, model-tool behavior and synthetic telemetry/protocol inputs. CI runs the suite on Windows with Python 3.11 and 3.13. This is software-level coverage only.
+
+The PyInstaller Windows folder build completed locally. Its executable served the dashboard and static JavaScript and passed start/stop API smoke checks (HTTP 200). This does not establish clean-machine installation or game compatibility.
 
 Windows keyring credential storage and OpenRouter authentication were smoke-checked successfully (HTTP 200); no credential value is included in this repository.
 
@@ -29,4 +31,4 @@ Use a test session and compare every displayed measurement with ACC. Check conne
 
 The calculations deliberately preserve uncertainty: stale or missing telemetry is treated as unknown, and the fuel estimate is based on measured laps plus a finishing-lap reserve assumption. Provider output can still be wrong; independently confirm important advice.
 
-The six model tools are read-only and return unknown when fresh data is unavailable. Gap-trend notifications are deterministic events; they do not establish a safe pass or predict future gaps. Rolling audio buffers, automatic follow-up listening and race briefings are not implemented. Follow-up listening is explicitly rejected by settings validation.
+The six model tools are read-only and return unknown when fresh data is unavailable. Gap-trend notifications are deterministic events; they do not establish a safe pass or predict future gaps. Rolling incident buffers, automatic follow-up listening and race briefings are not implemented. Follow-up listening is explicitly rejected by settings validation. The complete requested product remains the target in [PRODUCT_REQUIREMENTS.md](PRODUCT_REQUIREMENTS.md); this early release does not claim every V1 acceptance criterion is met.
