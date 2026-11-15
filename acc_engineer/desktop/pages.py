@@ -86,8 +86,8 @@ class Page(QWidget):
     def on_status(self):
         pass
 
-    def request(self, method, path, body=None, callback=None):
-        self.api.request(method, path, body, callback)
+    def request(self, method, path, body=None, callback=None, finished=None):
+        self.api.request(method, path, body, callback, finished=finished)
 
     def refresh(self):
         pass
@@ -239,18 +239,40 @@ class LibraryPage(Page):
         self.request("GET", "/api/library", callback=self._loaded)
 
     def _loaded(self, data):
+        selected_clip_id = self.current.get("id") if self.current else None
+        selected_version_id = self.version.get("id") if self.version else None
         self.clips = _items(data); self.count.setText(f"{len(self.clips)} scripts")
         self.list.setRowCount(0)
         for clip in self.clips:
             row = self.list.rowCount(); self.list.insertRow(row)
             for col, value in enumerate((clip.get("id"), clip.get("category"), clip.get("priority"), len(clip.get("versions", [])))):
                 item = QTableWidgetItem(str(value)); item.setData(Qt.ItemDataRole.UserRole, clip); self.list.setItem(row, col, item)
-        self.list.resizeColumnsToContents(); self.current = None; self.versions.setRowCount(0)
-        if self.list.rowCount(): self.list.selectRow(0)
+        self.list.resizeColumnsToContents(); self.current = None; self.version = None; self.versions.setRowCount(0)
+        selected_row = next((row for row, clip in enumerate(self.clips)
+                             if clip.get("id") == selected_clip_id), None)
+        if selected_row is not None:
+            self.list.selectRow(selected_row)
+            if selected_version_id:
+                for row in range(self.versions.rowCount()):
+                    version = self.versions.item(row, 0).data(Qt.ItemDataRole.UserRole)
+                    if version.get("id") == selected_version_id:
+                        self.versions.selectRow(row)
+                        break
+        elif self.list.rowCount():
+            self.list.selectRow(0)
+        else:
+            self.clip_title.setText("Select a script")
+            self.script.clear()
 
     def _select(self):
         rows = self.list.selectedItems()
-        if not rows: return
+        if not rows:
+            self.current = None
+            self.version = None
+            self.clip_title.setText("Select a script")
+            self.script.clear()
+            self.versions.setRowCount(0)
+            return
         clip = rows[0].data(Qt.ItemDataRole.UserRole); self.current = clip
         self.clip_title.setText(f"{clip.get('id')}  ·  {clip.get('category')}  ·  P{clip.get('priority')}")
         self.script.setPlainText(clip.get("text", "")); self.versions.setRowCount(0)
@@ -402,7 +424,7 @@ class SettingsPage(Page):
         self.budget = self._number(0, 1000, .01, 5); self.limit = self._number(0, 10, .01, .1)
         self.speed = self._number(.5, 2, .05, 1); self.volume = self._number(0, 1, .05, .8)
         self.frequency = QComboBox(); self.frequency.addItems(["off", "low", "normal", "high"])
-        self.timeout = QSpinBox(); self.timeout.setRange(3, 60)
+        self.timeout = QSpinBox(); self.timeout.setRange(3, 30)
         self.stale = self._number(.1, 10, .1, 2)
         self.port = QSpinBox(); self.port.setRange(1024, 65535)
         self.broadcast_enabled = QCheckBox("Enable ACC broadcasting integration")
@@ -410,7 +432,7 @@ class SettingsPage(Page):
         self.setup_root = QLineEdit(); browse = QPushButton("Browse…"); browse.clicked.connect(self._browse_setup); root_row = QHBoxLayout(); root_row.addWidget(self.setup_root); root_row.addWidget(browse)
         self.thresholds = QTextEdit(); self.thresholds.setMaximumHeight(120)
         self.profiles = QTextEdit(); self.profiles.setMaximumHeight(140)
-        self.form.addRow("Reasoning model", self.model); self.form.addRow("Speech model", self.speech_model); self.form.addRow("Voice name / ID", self.voice)
+        self.form.addRow("Reasoning model", self.model); self.form.addRow("Speech model", self.speech_model); self.form.addRow("Voice ID (optional)", self.voice)
         self.form.addRow("Weekly budget (USD)", self.budget); self.form.addRow("Per-request limit (USD)", self.limit); self.form.addRow("Speech speed", self.speed); self.form.addRow("Playback volume", self.volume)
         self.form.addRow("Commentary frequency", self.frequency); self.form.addRow("Recording timeout (seconds)", self.timeout); self.form.addRow("Telemetry stale threshold (seconds)", self.stale)
         self.form.addRow("Broadcast port", self.port); self.form.addRow("Broadcast password", self.broadcast_password); self.form.addRow("Broadcast", self.broadcast_enabled)
@@ -420,6 +442,23 @@ class SettingsPage(Page):
         self.key = QLineEdit(); self.key.setEchoMode(QLineEdit.EchoMode.Password); self.key.setPlaceholderText("sk-or-…"); self.form.insertRow(3, "OpenRouter API key", self.key)
         self.api_state = QLabel("Key status: checking…"); self.form.addRow("Credential status", self.api_state)
         self.settings = {}
+        self.voice.setPlaceholderText("Leave blank for Fish default voice")
+        self.voice_test_player = QMediaPlayer(self)
+        self.voice_test_output = QAudioOutput(self)
+        self.voice_test_player.setAudioOutput(self.voice_test_output)
+        self.voice_test_button = QPushButton("Test engineer voice")
+        self.prepare_speech_button = QPushButton("Prepare speech recognition")
+        self.voice_test_button.clicked.connect(self._test_voice)
+        self.prepare_speech_button.clicked.connect(self._prepare_speech)
+        voice_actions = QHBoxLayout(); voice_actions.addWidget(self.voice_test_button); voice_actions.addWidget(self.prepare_speech_button)
+        self.form.addRow("Speech tools", voice_actions)
+        voice_hint = QLabel("Voice test uses saved settings. Save settings before testing changes.")
+        voice_hint.setWordWrap(True)
+        voice_hint.setObjectName("mutedText")
+        self.form.addRow("", voice_hint)
+        self.speech_status = QLabel("Speech recognition status unavailable")
+        self.speech_status.setWordWrap(True)
+        self.form.addRow("Speech recognition", self.speech_status)
 
     @staticmethod
     def _number(minimum, maximum, step, value):
@@ -444,6 +483,58 @@ class SettingsPage(Page):
         self.profiles.setPlainText(_pretty(s.get("setup_profiles", {})))
         configured = (self.api.status.get("provider") or {}).get("key_configured")
         self.api_state.setText("Key configured" if configured else "No key configured")
+        self.on_status()
+
+    def _test_voice(self):
+        if self.status.get("running"):
+            self.api.notify.emit("Stop the engineer before testing voice playback.")
+            return
+        self.voice_test_button.setEnabled(False)
+        self.api.notify.emit("Generating engineer voice test…")
+        self.request("POST", "/api/voice/test", {}, self._voice_ready,
+                     finished=lambda: self.voice_test_button.setEnabled(True))
+
+    def _voice_ready(self, data):
+        url = (data or {}).get("url")
+        if not url or not url.startswith("/api/audio/"):
+            self.api.notify.emit("Voice test did not return playable audio.")
+            return
+        full_url = self.api.base_url.rstrip("/") + url
+        token = getattr(self.api, "access_token", "")
+        if token:
+            full_url += "?" + urlencode({"access_token": token})
+        self.voice_test_player.setSource(QUrl(full_url))
+        self.voice_test_player.play()
+        self.api.notify.emit("Playing engineer voice test.")
+
+    def _prepare_speech(self):
+        self.prepare_speech_button.setEnabled(False)
+        self.api.notify.emit("Preparing speech recognition model. The first download may take a while…")
+        self.request("POST", "/api/radio/prepare", {}, self._speech_prepared,
+                     finished=lambda: self.prepare_speech_button.setEnabled(True))
+
+    def _speech_prepared(self, data):
+        model = (data or {}).get("model", "speech model")
+        if (data or {}).get("ready"):
+            self.api.notify.emit(f"Speech recognition is ready ({model}). No microphone was opened.")
+            self.speech_status.setText(f"Ready · {model}")
+        else:
+            self.api.notify.emit("Speech recognition preparation did not complete.")
+
+    def on_status(self):
+        if self.status.get("running"):
+            self.voice_test_player.stop()
+        radio = self.status.get("radio") or {}
+        state = radio.get("stt_state")
+        if state:
+            model = radio.get("stt_model") or radio.get("model")
+            detail = {"ready": "Ready", "preparing": "Preparing speech recognition model…",
+                      "error": "Preparation failed", "not_prepared": "Not prepared"}.get(state, str(state))
+            if state == "error" and radio.get("last_error"):
+                detail += f" · {radio['last_error']}"
+            if model:
+                detail += f" · {model}"
+            self.speech_status.setText(detail)
 
     def _values(self):
         return {"model":self.model.text().strip(),"speech_model":self.speech_model.text().strip(),"voice":self.voice.text(),

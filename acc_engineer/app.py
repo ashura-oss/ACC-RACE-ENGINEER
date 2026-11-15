@@ -35,7 +35,7 @@ class Settings(BaseModel):
     radio_button: str = Field(default="R3", pattern="^(R3|L3|A|B|X|Y|LB|RB|START|BACK)$")
     keyboard_binding: str = Field(default="<f9>", pattern=r"^<f([1-9]|1[0-9]|2[0-4])>$")
     follow_up_listening: bool = False
-    recording_timeout_s: int = Field(default=30, ge=3, le=60)
+    recording_timeout_s: int = Field(default=30, ge=3, le=30)
     stale_after_s: float = Field(default=2, ge=.1, le=10)
     setup_root: str = Field(default="", max_length=500)
     setup_profiles: dict = Field(default_factory=dict)
@@ -58,6 +58,8 @@ class Chat(BaseModel):
 class Runtime:
     def __init__(self, root):
         self.store = Store(root)
+        if self.store.settings()["recording_timeout_s"] > 30:
+            self.store.save_settings({"recording_timeout_s": 30})
         seed_library(self.store)
         self.provider = OpenRouter(self.store)
         self.audio = AudioScheduler(self.store)
@@ -71,7 +73,8 @@ class Runtime:
         self.tasks = []
         self.conversations = set()
         self.chat_lock = asyncio.Lock()
-        self.radio = {"state": "idle", "controller": "unavailable", "stt": "local faster-whisper (optional)"}
+        self.radio = {"state": "idle", "controller": "unavailable", "stt": "local faster-whisper (optional)",
+                      "stt_state": "not_prepared", "stt_model": "base.en"}
         self.controller = None
         self.recorder = None
         self.radio_lock = asyncio.Lock()
@@ -142,7 +145,8 @@ class Runtime:
             from .controller import ControllerService, MicrophoneRecorder, LocalTranscriber
             loop = asyncio.get_running_loop()
             self.recorder = MicrophoneRecorder(max_seconds=self.store.settings()["recording_timeout_s"])
-            self.transcriber = LocalTranscriber()
+            if self.transcriber is None:
+                self.transcriber = LocalTranscriber(cache_dir=self.store.root / "stt-models")
             key = self.store.settings()["keyboard_binding"].lower().strip("<>")
             vk = 111 + int(key[1:]) if key.startswith("f") and key[1:].isdigit() and 1 <= int(key[1:]) <= 24 else None
             self.controller = ControllerService(
@@ -256,6 +260,8 @@ class Runtime:
                 raise ValueError("Start the engineer first.")
             if not self.recorder:
                 raise ValueError("Microphone unavailable. Install radio extras.")
+            if self.radio.get("stt_state") == "preparing":
+                raise ValueError("Speech recognition is preparing. Wait for the ready status before recording.")
             if self.radio["state"] == "processing":
                 return self.radio
             if self.radio["state"] == "recording":
@@ -293,12 +299,37 @@ class Runtime:
         self.audio.recording = False
 
     async def transcribe_and_chat(self, audio, generation):
+        from .controller import TranscriptionError
         try:
-            text = await asyncio.to_thread(self.transcriber.transcribe, audio)
-            if text.strip() and generation == self.radio_generation and self.running:
+            try:
+                text = await asyncio.to_thread(self.transcriber.transcribe, audio)
+                if hasattr(self.transcriber, "status"):
+                    ready = self.transcriber.status().get("ready", False)
+                    self.radio["stt_state"] = "ready" if ready else "not_prepared"
+                    if ready:
+                        self.radio.pop("stt_error_category", None)
+            except TranscriptionError as exc:
+                self.radio["stt_state"] = "error"
+                self.radio["stt_error_category"] = exc.category
+                self.radio["last_error"] = str(exc)
+                self.error(str(exc))
+                return
+            except Exception:
+                self.radio["stt_state"] = "error"
+                self.error("Local speech recognition failed. Prepare speech recognition in AI settings, then retry.")
+                return
+            if generation != self.radio_generation or not self.running:
+                return
+            if not text.strip():
+                self.radio["last_error"] = "No speech detected. Check the Windows default microphone and try again."
+                self.error(self.radio["last_error"])
+                return
+            try:
                 await self.chat(text)
-        except Exception:
-            self.error("Radio transcription or response failed. Check local STT and provider configuration.")
+            except ProviderError as exc:
+                self.error("AI response failed: " + str(exc))
+            except ValueError as exc:
+                self.error(str(exc))
         finally:
             if generation == self.radio_generation:
                 self.radio["state"] = "idle"
@@ -553,6 +584,40 @@ def create_app(data_dir=None, api_token=None):
     @app.post("/api/radio/toggle")
     async def toggle():
         return await runtime.toggle_radio()
+
+    @app.post("/api/radio/prepare")
+    async def prepare_recognizer():
+        from .controller import LocalTranscriber, TranscriptionError
+        if runtime.radio["state"] != "idle":
+            raise ValueError("Finish or cancel the current recording before preparing speech recognition.")
+        if runtime.radio.get("stt_state") == "preparing":
+            raise ValueError("Speech recognition is already preparing.")
+        if runtime.transcriber is None:
+            runtime.transcriber = LocalTranscriber(cache_dir=runtime.store.root / "stt-models")
+        runtime.radio["stt_state"] = "preparing"
+        try:
+            await asyncio.to_thread(runtime.transcriber.prepare)
+        except TranscriptionError as exc:
+            runtime.radio["stt_state"] = "error"
+            runtime.radio["stt_error_category"] = exc.category
+            runtime.radio["last_error"] = str(exc)
+            runtime.error(str(exc))
+            raise ValueError(str(exc)) from None
+        runtime.radio["stt_state"] = "ready"
+        runtime.radio.pop("stt_error_category", None)
+        runtime.radio.pop("last_error", None)
+        return runtime.transcriber.status()
+
+    @app.post("/api/voice/test")
+    async def test_voice():
+        if runtime.running:
+            raise ValueError("Stop the engineer before playing a test voice.")
+        text = "Radio check. Engineer online."
+        data = await runtime.provider.speech(text)
+        version_id = uuid.uuid4().hex
+        (runtime.store.root / "audio" / (version_id + ".wav")).write_bytes(
+            apply_volume(data, runtime.store.settings()["volume"]))
+        return {"url": "/api/audio/" + version_id, "text": text}
 
     @app.post("/api/radio/cancel")
     async def cancel():

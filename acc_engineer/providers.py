@@ -3,6 +3,9 @@ import asyncio
 import os
 import time
 import math
+import io
+import wave
+from email.message import Message
 
 import httpx
 
@@ -103,7 +106,7 @@ class OpenRouter:
                     "estimated": actual is None, "tokens": usage.get("total_tokens"),
                     "latency_ms": round((time.perf_counter()-started)*1000)})
                 return response
-            except (httpx.HTTPError, ProviderError):
+            except httpx.HTTPError:
                 raise ProviderError("Provider request failed; local warnings remain active.") from None
 
     async def answer(self, message, context, image=None):
@@ -149,11 +152,45 @@ class OpenRouter:
 
     async def speech(self, text):
         settings = self.store.settings()
-        if not settings["voice"]:
-            raise ProviderError("Select a verified Fish Audio voice before generating speech.")
-        payload = {"model": settings["speech_model"], "input": text, "voice": settings["voice"],
-                   "response_format": "wav", "speed": settings["speech_speed"]}
+        payload = {"model": settings["speech_model"], "input": text,
+                   "response_format": "pcm", "speed": settings["speech_speed"]}
+        # Fish accepts its provider default voice when no ID is supplied. Never
+        # invent a voice identifier or block the supported default unnecessarily.
+        if settings["voice"].strip():
+            payload["voice"] = settings["voice"].strip()
+        if settings["speech_model"].startswith("fish-audio/"):
+            payload["instructions"] = "A calm professional British male motorsport race engineer. Clear natural radio delivery."
         response = await self._post(settings["speech_model"], "/audio/speech", payload)
-        if not response.content.startswith(b"RIFF"):
-            raise ProviderError("Speech provider did not return WAV audio.")
-        return response.content
+        return speech_to_wav(response.content, response.headers.get("content-type", ""))
+
+
+def speech_to_wav(data, content_type):
+    """Wrap OpenRouter's PCM16LE using the returned rate/channels, never guessed."""
+    if not data or len(data) > 16_000_000:
+        raise ProviderError("Speech provider returned empty or oversized audio.")
+    if data.startswith(b"RIFF"):
+        try:
+            with wave.open(io.BytesIO(data), "rb") as source:
+                if source.getsampwidth() != 2 or source.getnframes() == 0:
+                    raise ValueError
+            return data
+        except (ValueError, EOFError, wave.Error):
+            raise ProviderError("Speech provider returned an invalid WAV recording.") from None
+    metadata = Message()
+    metadata["content-type"] = content_type
+    if metadata.get_content_type() != "audio/pcm":
+        raise ProviderError("Speech provider returned an unsupported audio format.")
+    try:
+        rate = int(metadata.get_param("rate") or 0)
+        channels = int(metadata.get_param("channels") or 0)
+        if not 8000 <= rate <= 192000 or channels not in (1, 2) or len(data) % (2 * channels):
+            raise ValueError
+    except (TypeError, ValueError):
+        raise ProviderError("Speech PCM metadata is missing or invalid; sample rate was not guessed.") from None
+    output = io.BytesIO()
+    with wave.open(output, "wb") as target:
+        target.setnchannels(channels)
+        target.setsampwidth(2)
+        target.setframerate(rate)
+        target.writeframes(data)
+    return output.getvalue()

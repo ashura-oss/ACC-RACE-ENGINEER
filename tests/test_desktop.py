@@ -120,6 +120,56 @@ def test_settings_page_only_reads_settings_until_user_saves(window):
     assert body == {"api_key": "sk-or-test-value"}
 
 
+def test_settings_voice_test_clarifies_it_uses_saved_settings(window):
+    instance, _api = window
+    page = instance.pages["AI settings"]
+    assert page.voice_test_button.text() == "Test engineer voice"
+    assert page.voice.placeholderText() == "Leave blank for Fish default voice"
+    assert any("Save settings before testing changes" in label.text()
+               for label in page.findChildren(QWidget) if hasattr(label, "text"))
+
+
+def test_settings_shows_radio_stt_state_and_error(window):
+    instance, api = window
+    page = instance.pages["AI settings"]
+    api.status_changed.emit({"radio": {"stt_state": "error", "stt_model": "base.en",
+                                        "last_error": "Model download failed"}})
+    assert "Preparation failed" in page.speech_status.text()
+    assert "Model download failed" in page.speech_status.text()
+    assert "base.en" in page.speech_status.text()
+
+
+def test_library_refresh_preserves_clip_and_version_then_clears_stale_selection(window):
+    instance, _api = window
+    page = instance.pages["Radio library"]
+    clip_a = {"id": "clip-a", "category": "test", "priority": 1, "text": "A",
+              "versions": [{"id": "v-a1", "timestamp": 1, "approved": False},
+                           {"id": "v-a2", "timestamp": 2, "approved": True}]}
+    clip_b = {"id": "clip-b", "category": "test", "priority": 2, "text": "B", "versions": []}
+    page._loaded([clip_a, clip_b])
+    page.list.selectRow(0)
+    page.versions.selectRow(1)
+    assert page.current["id"] == "clip-a"
+    assert page.version["id"] == "v-a1"
+    page._loaded([clip_a, clip_b])
+    assert page.current["id"] == "clip-a"
+    assert page.version["id"] == "v-a1"
+
+    page.list.clearSelection()
+    assert page.current is None
+    assert page.version is None
+    page._toggle_approval()
+    page._delete_version()
+    assert not any(path.endswith("/approve") or "/versions/" in path
+                   for _method, path, _body, _callback in _api.calls)
+
+    page._loaded([clip_a])
+    assert page.current["id"] == "clip-a"
+    assert page.version["id"] == "v-a2"  # Most recent version is selected initially.
+    page._loaded([clip_a])
+    assert page.version["id"] == "v-a2"
+
+
 def test_native_window_close_stops_api_and_owned_backend(qapp):
     api = FakeAPI()
     backend = FakeBackend()

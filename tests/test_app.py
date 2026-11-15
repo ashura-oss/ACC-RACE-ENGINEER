@@ -75,7 +75,8 @@ def test_controller_start_and_stop_are_awaited(tmp_path, monkeypatch):
             pass
 
     class FakeTranscriber:
-        pass
+        def __init__(self, **kwargs):
+            pass
 
     class FakeController:
         def __init__(self, **kwargs):

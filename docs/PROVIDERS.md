@@ -9,7 +9,9 @@ OpenRouter is optional. It provides the model catalogue, text completions and ge
 | Radio text | `deepseek/deepseek-v4.1-flash` | `/chat/completions` |
 | Generated speech | `fish-audio/drama-3` | `/audio/speech` |
 
-The speech model is resolved through OpenRouter's model endpoint catalogue (`/models/{model}/endpoints`) when it is not in the normal text catalogue. A Fish Audio voice must be selected in the dashboard before speech can be generated. These identifiers/endpoints were verified against the live OpenRouter catalogue for this release; availability and pricing may change. The app refreshes catalogue/pricing when needed and blocks requests if pricing data is missing.
+The speech model is resolved through OpenRouter's model endpoint catalogue (`/models/{model}/endpoints`) when it is not in the normal text catalogue. Leave the optional Fish voice ID blank to use the provider default, or supply a supported Fish reference voice ID. Voice identity is not guaranteed to remain identical across requests when using the provider default. The app requests PCM and wraps it into WAV using the sample rate and channels returned in the Content-Type header; it does not guess the sample rate. These identifiers/endpoints were verified against the live OpenRouter catalogue for this release; availability and pricing may change.
+
+AI settings includes **Test saved voice** and **Prepare speech recognition**. Save edited settings before testing voice. Preparation downloads/loads the local recognition model without opening the microphone. The recorder supplies PCM16 mono 16 kHz samples directly to faster-whisper as a normalized NumPy array, avoiding the incompatible AV decoder path. Models are cached under the application data directory.
 
 ## Credentials
 

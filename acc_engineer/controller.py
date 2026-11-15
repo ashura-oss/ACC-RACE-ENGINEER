@@ -6,8 +6,11 @@ import ctypes
 import inspect
 import io
 import os
+import struct
+import threading
 import time
 import wave
+from pathlib import Path
 
 XBOX_BUTTONS = {'A':0x1000,'B':0x2000,'X':0x4000,'Y':0x8000,'LB':0x100,'RB':0x200,'BACK':0x20,'START':0x10,'L3':0x40,'R3':0x80}
 
@@ -166,14 +169,82 @@ class MicrophoneRecorder:
         self.stop()
 
 
+class TranscriptionError(RuntimeError):
+    """Safe, user-displayable local STT failure with a stable category."""
+    def __init__(self, category, message):
+        super().__init__(message)
+        self.category = category
+
+
 class LocalTranscriber:
-    """Opt-in faster-whisper CPU recognizer; model download occurs on first use."""
-    def __init__(self, model='base.en'):
+    """Opt-in faster-whisper CPU recognizer with a persistent first-use cache."""
+    MAX_WAV_BYTES = 2_000_000
+    MAX_SECONDS = 30
+
+    def __init__(self, model='base.en', cache_dir=None):
         self.model_name, self._model = model, None
+        self.cache_dir = Path(cache_dir) if cache_dir else Path(os.environ.get('LOCALAPPDATA') or Path.home()) / 'ACC Race Engineer' / 'stt-models'
+        self._lock = threading.RLock()
+
+    def status(self):
+        with self._lock:
+            return {'ready': self._model is not None, 'model': self.model_name}
+
+    def prepare(self):
+        """Download/load the model on demand; errors are safe to display."""
+        with self._lock:
+            self._load_model()
+            return self.status()
+
+    def _load_model(self):
+        if self._model is not None:
+            return self._model
+        try:
+            from faster_whisper import WhisperModel
+        except (ImportError, OSError):
+            raise TranscriptionError('unavailable', 'Local speech recognition is unavailable. Install or repair the voice recognition component.') from None
+        try:
+            self.cache_dir.mkdir(parents=True, exist_ok=True)
+            self._model = WhisperModel(self.model_name, device='cpu', compute_type='int8', download_root=str(self.cache_dir))
+        except (OSError, PermissionError):
+            raise TranscriptionError('storage', 'Local speech recognition could not access its model cache. Check disk space and user folder access.') from None
+        except Exception:
+            # The model constructor can fail for missing DLLs, network/download errors,
+            # corrupt/incomplete model files, and unsupported runtime environments.
+            raise TranscriptionError('model_setup', 'Local speech recognition could not load its model. Check your internet connection on first use, then restart the app.') from None
+        return self._model
+
+    @classmethod
+    def _validate_wav(cls, wav_data):
+        if not wav_data:
+            return False
+        if not isinstance(wav_data, (bytes, bytearray)) or len(wav_data) > cls.MAX_WAV_BYTES:
+            raise TranscriptionError('invalid_audio', 'The microphone recording is invalid or exceeds the 30 second limit. Please record again.')
+        try:
+            with wave.open(io.BytesIO(wav_data), 'rb') as wav:
+                channels, width, rate, frames = wav.getnchannels(), wav.getsampwidth(), wav.getframerate(), wav.getnframes()
+                expected = wav.readframes(frames)
+        except (wave.Error, EOFError, OSError, struct.error):
+            raise TranscriptionError('invalid_audio', 'The microphone recording is incomplete or unreadable. Please record again.') from None
+        if channels != 1 or width != 2 or rate != 16000 or frames <= 0 or frames / rate > cls.MAX_SECONDS or len(expected) != frames * channels * width:
+            raise TranscriptionError('invalid_audio', 'The microphone recording has an unsupported format or duration. Please record again.')
+        # Avoid a model load/download for genuine digital silence.
+        if not any(expected):
+            return False
+        return True
 
     def transcribe(self, wav_data):
-        if self._model is None:
-            from faster_whisper import WhisperModel
-            self._model = WhisperModel(self.model_name,device='cpu',compute_type='int8')
-        segments, _ = self._model.transcribe(io.BytesIO(wav_data),beam_size=1,vad_filter=True)
-        return ' '.join(part.text.strip() for part in segments).strip()
+        if not self._validate_wav(wav_data):
+            return ''
+        # Serialize both model initialization and inference; faster-whisper model
+        # instances are shared across callers and are not guaranteed thread-safe.
+        with self._lock:
+            model = self._load_model()
+            try:
+                import numpy as np
+                with wave.open(io.BytesIO(wav_data), 'rb') as wav:
+                    audio = np.frombuffer(wav.readframes(wav.getnframes()), dtype='<i2').astype(np.float32) / 32768.0
+                segments, _ = model.transcribe(audio, beam_size=1, vad_filter=True)
+                return ' '.join(part.text.strip() for part in segments).strip()
+            except Exception:
+                raise TranscriptionError('recognition', 'Local speech recognition could not process this recording. Please try again.') from None
