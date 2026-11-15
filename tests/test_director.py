@@ -149,4 +149,3 @@ def test_profile_name_and_profanity_only_affect_win_when_enabled():
     explicit = profane.process(frame(position=1), [{"kind": "flag_checkered"}], {}, now=1000)[0]
     assert "good shit" in explicit["text"].lower()
     assert explicit.get("clip_id") is None
-

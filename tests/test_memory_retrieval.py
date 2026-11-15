@@ -148,4 +148,3 @@ def test_natural_query_recalls_relevant_note_without_generic_radio_checks(tmp_pa
     assert matches and matches[0]["session_id"] == "preferences"
     assert not any(row["session_id"] == "radio-check" for row in matches)
     store.close()
-

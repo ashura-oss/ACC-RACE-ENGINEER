@@ -107,4 +107,3 @@ def test_stereo_tempo_preserves_distinct_channel_pitches():
     peaks = [np.fft.rfftfreq(len(channels), 1 / rate)[np.argmax(np.abs(np.fft.rfft(channels[:, i])))]
              for i in range(2)]
     assert peaks == pytest.approx([440, 880], abs=3)
-
