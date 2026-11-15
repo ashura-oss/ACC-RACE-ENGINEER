@@ -1,10 +1,14 @@
 import ctypes
 import struct
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
 
 from acc_engineer.controller import ButtonEdge, ControllerService
-from acc_engineer.telemetry import BroadcastingClient, Graphics, Physics, parse_broadcast_packet, registration_packet
+from acc_engineer import telemetry
+from acc_engineer.telemetry import AccSharedMemory, BroadcastingClient, Graphics, Physics, parse_broadcast_packet, registration_packet
 
 
 def test_shared_memory_offsets_are_windows_sdk_offsets():
@@ -65,3 +69,43 @@ def test_invalid_binding_and_nonlocal_broadcast_rejected():
         ControllerService(lambda:None,button='nope')
     with pytest.raises(ValueError):
         BroadcastingClient(host='8.8.8.8')
+
+
+def test_shared_memory_close_waits_for_inflight_read(monkeypatch):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class FakeMapping:
+        def __init__(self, payload, blocks=False):
+            self.payload = payload
+            self.blocks = blocks
+            self.closed = False
+
+        def read(self):
+            if self.blocks:
+                entered.set()
+                assert release.wait(timeout=2)
+            return self.payload
+
+        def close(self):
+            self.closed = True
+
+    # Use synthetic, zeroed SDK-sized pages. No Windows mapping is opened.
+    physics, graphics = FakeMapping(bytes(ctypes.sizeof(Physics)), True), FakeMapping(bytes(ctypes.sizeof(Graphics)))
+    reader = AccSharedMemory()
+    reader._maps = [physics, graphics]
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+    read_thread = threading.Thread(target=reader.read)
+    close_thread = threading.Thread(target=reader.close)
+    read_thread.start()
+    assert entered.wait(timeout=1)
+    close_thread.start()
+    time.sleep(.03)
+    assert physics.closed is False
+    release.set()
+    read_thread.join(timeout=1)
+    close_thread.join(timeout=1)
+    assert not read_thread.is_alive()
+    assert not close_thread.is_alive()
+    assert physics.closed and graphics.closed
+    assert reader._maps == []

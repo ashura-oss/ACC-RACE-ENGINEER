@@ -407,7 +407,10 @@ def create_app(data_dir=None):
 
     @app.get("/api/activity")
     async def activity():
-        return runtime.store.recent("activity")
+        rows = []
+        for kind in ("activity", "usage_detail", "tool", "error"):
+            rows.extend(record | {"kind": kind} for record in runtime.store.recent(kind, 50))
+        return sorted(rows, key=lambda row: row["timestamp"], reverse=True)[:150]
 
     @app.get("/api/usage")
     async def usage():

@@ -104,20 +104,25 @@ def test_controller_start_and_stop_are_awaited(tmp_path, monkeypatch):
         assert controller.stopped is True
 
 
-def test_critical_event_kind_uses_approved_clip_alias(tmp_path, monkeypatch):
+def test_critical_event_kinds_resolve_approved_clips(tmp_path, monkeypatch):
+    import asyncio
+    from pathlib import Path
+
     with TestClient(create_app(tmp_path)) as client:
         runtime = client.app.state.runtime
-        clip = runtime.store.clip("yellow")
-        clip["versions"] = [{"id": "approved-yellow", "approved": True}]
-        runtime.store.put_clip(clip)
         queued = []
-        async def cancel_radio():
-            pass
-        monkeypatch.setattr(runtime, "cancel_radio", cancel_radio)
         monkeypatch.setattr(runtime.audio, "enqueue", lambda path, priority, session="": queued.append((str(path), priority, session)))
-        import asyncio
-        asyncio.run(runtime.announce({"kind": "flag_yellow", "priority": 0}))
-        assert queued == [(str(runtime.store.root / "audio" / "approved-yellow.wav"), 0, "")]
+        cases = [("flag_yellow", "yellow"), ("flag_red", "red"),
+                 ("low_fuel", "fuel_critical"), ("severe_incident", "damage_severe")]
+        async def exercise():
+            for event_kind, clip_id in cases:
+                clip = runtime.store.clip(clip_id)
+                clip["versions"] = [{"id": "approved-" + clip_id, "approved": True}]
+                runtime.store.put_clip(clip)
+                await runtime.announce({"kind": event_kind, "priority": 0})
+        asyncio.run(exercise())
+        assert [Path(path).name for path, _, _ in queued] == ["approved-" + clip + ".wav" for _, clip in cases]
+        assert all(priority == 0 for _, priority, _ in queued)
 
 
 def test_canceled_transcription_does_not_start_chat(tmp_path):
@@ -215,5 +220,42 @@ def test_stop_cancels_direct_chat_response_task(tmp_path):
 
     asyncio.run(exercise())
     assert canceled == [True]
+    runtime.store.close()
+    asyncio.run(runtime.provider.client.aclose())
+
+
+def test_stop_during_screenshot_capture_suppresses_provider_call(tmp_path, monkeypatch):
+    import asyncio
+    import threading
+    import acc_engineer.vision as vision_module
+    from acc_engineer.app import Chat
+
+    app = create_app(tmp_path)
+    runtime = app.state.runtime
+    runtime.running = True
+    entered, release = threading.Event(), threading.Event()
+    provider_calls = []
+    def capture():
+        entered.set()
+        release.wait(timeout=2)
+        return "data:image/jpeg;base64,captured"
+    async def answer(*args, **kwargs):
+        provider_calls.append((args, kwargs))
+        return "unexpected"
+    monkeypatch.setattr(vision_module, "capture_data_url", capture)
+    monkeypatch.setattr(runtime.provider, "answer", answer)
+    endpoint = next(route.endpoint for route in app.routes if getattr(route, "path", None) == "/api/vision")
+
+    async def exercise():
+        task = asyncio.create_task(endpoint(Chat(message="What is on screen?")))
+        assert await asyncio.to_thread(entered.wait, 1)
+        runtime.running = False
+        runtime.generation += 1
+        release.set()
+        result = await asyncio.wait_for(task, 1)
+        assert result["suppressed"] is True
+
+    asyncio.run(exercise())
+    assert provider_calls == []
     runtime.store.close()
     asyncio.run(runtime.provider.client.aclose())

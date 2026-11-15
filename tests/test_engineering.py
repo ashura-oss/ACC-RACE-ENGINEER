@@ -1,8 +1,18 @@
 import time
+import itertools
 
 import pytest
 
 from acc_engineer.engineering import EventEngine, fuel_projection
+
+
+@pytest.fixture(autouse=True)
+def precise_clock(monkeypatch):
+    # Python 3.11 on Windows can return identical wall times for adjacent
+    # synthetic frames. Advance a controlled clock rather than depending on CPU speed.
+    start = time.time()
+    ticks = itertools.count()
+    monkeypatch.setattr(time, "time", lambda: start + next(ticks) * .0001)
 
 
 def frame(**kwargs):
@@ -83,6 +93,26 @@ def test_invalid_laps_not_used_for_consumption():
     engine.process(frame())
     engine.process(frame(completed_laps=2, fuel_l=28, last_lap_ms=90000))
     engine.process(frame(completed_laps=3, fuel_l=26, last_lap_ms=90000, last_lap_valid=False))
+    assert engine.fuel_history == []
+
+
+def test_lap_validity_is_carried_across_timing_line():
+    engine = EventEngine()
+    engine.process(frame(lap_valid=True))
+    # The timing line resets ACC's current-lap validity, but the just-finished
+    # lap was valid and should still contribute its measured time.
+    engine.process(frame(completed_laps=2, last_lap_ms=90000, lap_valid=False))
+    assert engine.lap_history == [90.0]
+    # The current lap was invalid, so its next timing-line sample is excluded.
+    engine.process(frame(completed_laps=3, last_lap_ms=91000, lap_valid=True))
+    assert engine.lap_history == [90.0]
+
+
+def test_unknown_lap_validity_does_not_add_samples():
+    engine = EventEngine()
+    engine.process(frame(lap_valid=None))
+    engine.process(frame(completed_laps=2, last_lap_ms=90000, lap_valid=None))
+    assert engine.lap_history == []
     assert engine.fuel_history == []
 
 
