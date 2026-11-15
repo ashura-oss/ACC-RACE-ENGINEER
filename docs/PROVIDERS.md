@@ -6,7 +6,7 @@ OpenRouter is optional. It provides the model catalogue, text completions and ge
 
 | Use | Model identifier | Endpoint |
 | --- | --- | --- |
-| Radio text | `deepseek/deepseek-v4.1-flash` | `/chat/completions` |
+| Radio text | `openai/gpt-6-luna` | `/chat/completions` |
 | Generated speech | `fish-audio/drama-3` | `/audio/speech` |
 
 The speech model is resolved through OpenRouter's model endpoint catalogue (`/models/{model}/endpoints`) when it is not in the normal text catalogue. Every speech request explicitly pins a voice ID. The default is Fish Official Adrian (`bf322df2096a46f18c579d0baa36f41d`); a blank field resolves to that same fixed ID. The app never silently falls back to an unselected provider voice. Cached recordings must match the selected voice, speech model and script before approval/playback; legacy versions remain preserved but inactive. The app requests PCM and wraps it into WAV using the sample rate and channels returned in the Content-Type header; it does not guess the sample rate. These identifiers/endpoints were verified against the live OpenRouter catalogue for this release; availability and pricing may change.

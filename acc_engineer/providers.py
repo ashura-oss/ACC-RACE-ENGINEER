@@ -27,6 +27,41 @@ class ProviderError(RuntimeError):
     pass
 
 
+def _web_search_enabled(model, payload):
+    """Whether this request can invoke OpenRouter's separately billed search."""
+    if str(model).endswith(":online"):
+        return True
+    if not isinstance(payload, dict):
+        return False
+
+    plugins = payload.get("plugins", [])
+    if isinstance(plugins, (dict, list)):
+        plugin_items = plugins.values() if isinstance(plugins, dict) else plugins
+        for plugin in plugin_items:
+            if isinstance(plugin, str):
+                label = plugin
+            elif isinstance(plugin, dict):
+                label = " ".join(str(plugin.get(key, "")) for key in ("id", "name", "type"))
+            else:
+                continue
+            if "web" in label.lower() or "search" in label.lower():
+                return True
+
+    # OpenRouter may expose search as a tool rather than a plugin. Look only at
+    # tool declarations, not arbitrary user prompt text.
+    tools = payload.get("tools", [])
+    if isinstance(tools, list):
+        for tool in tools:
+            if isinstance(tool, dict):
+                function = tool.get("function", {})
+                label = " ".join(str(tool.get(key, "")) for key in ("type", "name"))
+                if isinstance(function, dict):
+                    label += " " + str(function.get("name", ""))
+                if "web" in label.lower() or "search" in label.lower():
+                    return True
+    return False
+
+
 class OpenRouter:
     BASE = "https://openrouter.ai/api/v1"
 
@@ -76,15 +111,57 @@ class OpenRouter:
                 raise ProviderError("Model or pricing unavailable; request blocked.")
             pricing = info["pricing"]
             try:
-                prompt_rate = float(pricing["prompt"])
-                completion_rate = float(pricing["completion"])
-                if not all(math.isfinite(v) and v >= 0 for v in (prompt_rate, completion_rate)):
+                if not isinstance(pricing, dict):
                     raise ValueError
-                # Refuse unknown additional billing dimensions. Catalogue discounts and
-                # cache rates cannot increase the conservative uncached upper estimate.
+                prompt_rates = [float(pricing["prompt"])]
+                completion_rates = [float(pricing["completion"])]
+                cache_write_rates = [float(pricing.get("input_cache_write", 0))]
+                if not all(math.isfinite(v) and v >= 0 for v in prompt_rates + completion_rates):
+                    raise ValueError
+                # Luna's catalogue entry has an optional, separately billed web
+                # search rate. Accept the metadata only when this request cannot
+                # invoke search; search itself has no local usage bound.
                 for name, value in pricing.items():
-                    if name not in {"prompt", "completion", "discount", "input_cache_read", "input_cache_write"} and float(value or 0) > 0:
+                    if name in {"prompt", "completion", "discount", "input_cache_read", "input_cache_write"}:
+                        numeric = float(value or 0)
+                        if not math.isfinite(numeric) or numeric < 0:
+                            raise ValueError
+                    elif name == "web_search":
+                        numeric = float(value)
+                        if not math.isfinite(numeric) or numeric < 0 or (numeric > 0 and _web_search_enabled(model, payload)):
+                            raise ValueError
+                    elif name == "overrides":
+                        if not isinstance(value, list):
+                            raise ValueError
+                        for tier in value:
+                            if not isinstance(tier, dict) or set(tier) - {
+                                "min_prompt_tokens", "prompt", "completion",
+                                "input_cache_read", "input_cache_write",
+                            }:
+                                raise ValueError
+                            minimum = tier.get("min_prompt_tokens")
+                            if isinstance(minimum, bool) or not isinstance(minimum, (int, float)) or not math.isfinite(minimum) or minimum < 0:
+                                raise ValueError
+                            if "prompt" not in tier or "completion" not in tier:
+                                raise ValueError
+                            tier_prompt = float(tier["prompt"])
+                            tier_completion = float(tier["completion"])
+                            if not all(math.isfinite(v) and v >= 0 for v in (tier_prompt, tier_completion)):
+                                raise ValueError
+                            for cache_name in ("input_cache_read", "input_cache_write"):
+                                if cache_name in tier:
+                                    cache_rate = float(tier[cache_name])
+                                    if not math.isfinite(cache_rate) or cache_rate < 0:
+                                        raise ValueError
+                            cache_write_rates.append(float(tier.get("input_cache_write", 0)))
+                            prompt_rates.append(tier_prompt)
+                            completion_rates.append(tier_completion)
+                    else:
                         raise ValueError
+                # Reserve cache writes in addition to uncached input as a safe
+                # upper bound even if a provider automatically enables caching.
+                prompt_rate = max(prompt_rates) + max(cache_write_rates)
+                completion_rate = max(completion_rates)
             except (KeyError, TypeError, ValueError):
                 raise ProviderError("Unverified pricing units; request blocked.") from None
             # Token upper bound: UTF-8 bytes plus margin. Speech prompt units are
