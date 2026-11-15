@@ -82,7 +82,7 @@ class EngineerWindow(QMainWindow):
         self.connection = QLabel("Starting local engine…")
         self.connection.setWordWrap(True)
         side.addWidget(self.connection)
-        native = QLabel("WINDOWS DESKTOP  •  V0.2")
+        native = QLabel("WINDOWS DESKTOP  •  V0.3")
         native.setObjectName("subtitle")
         side.addWidget(native)
         layout.addWidget(sidebar)
@@ -128,7 +128,10 @@ class EngineerWindow(QMainWindow):
     def update_status(self, status):
         running = status.get("running", False)
         age = status.get("telemetry_age_s")
-        live = status.get("source") == "acc" and age is not None and age < 2
+        live = (status.get("source") == "acc" and (status.get("telemetry") or {}).get("status") == "live"
+                and not (status.get("telemetry") or {}).get("stale")
+                and (status.get("telemetry") or {}).get("physics_valid") is not False
+                and age is not None and age < 2)
         self.engine_state.setText(("ENGINEER ACTIVE" if running else "ENGINEER STOPPED") +
             ("   •   ACC LIVE" if live else "   •   WAITING FOR ACC") +
             ("   •   MICROPHONE RECORDING" if status.get("radio", {}).get("state") == "recording" else ""))

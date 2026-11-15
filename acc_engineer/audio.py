@@ -1,7 +1,10 @@
 """Single-worker WAV playback; P0 preempts without any network dependency."""
 import asyncio
+import hashlib
 import heapq
+import json
 import os
+import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -26,6 +29,9 @@ SCRIPTS = [
     ("race_start", "session", 1, "We're racing. Settle into your rhythm."),
     ("session_change", "session", 3, "New session. Let's get ready."),
     ("race_finish", "session", 1, "Chequered flag. Bring it home."),
+    ("race_win", "session", 1, "Booyah! P1! That's a fantastic drive. Bring it home."),
+    ("incident_follow_up", "conversation", 1, "Talk to me. How's the car feeling after that?"),
+    ("strategy_call", "strategy", 2, "Let's stick to the plan. I'll keep you updated."),
     ("tyre_hot", "tyres", 3, "Tyre temperatures are climbing. Let's manage them."),
     ("brake_hot", "brakes", 1, "Brakes are running hot. Keep an eye on them."),
     ("acknowledge", "conversation", 2, "Copy that."),
@@ -36,6 +42,18 @@ SCRIPTS = [
     ("gap_ahead_closing", "competitors", 3, "You're closing on the car ahead. Keep it clean."),
     ("gap_behind_gaining", "competitors", 1, "The car behind is closing. Keep your focus."),
 ]
+
+
+def clip_emotion(clip_id):
+    if clip_id in {"damage_severe", "damage_moderate", "incident_follow_up", "check_in"}:
+        return "concerned"
+    if clip_id in {"red", "yellow", "fuel_critical", "box_urgent"}:
+        return "urgent"
+    if clip_id in {"race_win", "personal_best"}:
+        return "excited"
+    if clip_id in {"penalty", "invalid_lap", "fuel_low", "tyre_hot", "brake_hot"}:
+        return "firm"
+    return "neutral"
 
 
 def seed_library(store):
@@ -52,11 +70,14 @@ class Message:
     path: str = field(compare=False)
     expires: float = field(compare=False)
     session: str = field(compare=False, default="")
+    finished: asyncio.Event = field(compare=False, default_factory=asyncio.Event)
+    outcome: str = field(compare=False, default="queued")
 
 
 class AudioScheduler:
-    def __init__(self, store):
+    def __init__(self, store, renderer=None):
         self.store = store
+        self.renderer = renderer
         self.queue = []
         self.wake = asyncio.Event()
         self.current = None
@@ -65,15 +86,38 @@ class AudioScheduler:
         self.session = ""
         self.sequence = 0
 
-    def enqueue(self, path, priority=2, ttl=15, session=""):
+    def enqueue(self, path, priority=2, ttl=15, session="", emotion="neutral", prepared=False):
+        path = Path(path)
+        if priority == 0:
+            self.interrupt_noncritical()
+        if self.renderer is not None and not prepared:
+            try:
+                path = self.renderer.render_file(path, emotion=emotion)
+            except (OSError, ValueError, RuntimeError):
+                self.store.add("playback", {"outcome": "invalid_clip", "path": str(path)})
+                return False
         self.sequence += 1
         message = Message(priority, self.sequence, str(path), time.monotonic()+ttl, session)
         heapq.heappush(self.queue, message)
-        if priority == 0 and self.current and self.current.priority > 0:
+        self.wake.set()
+        return message
+
+    def interrupt_noncritical(self):
+        for item in self.queue:
+            if item.priority > 0:
+                self.finish(item, "interrupted")
+        self.queue[:] = [item for item in self.queue if item.priority == 0]
+        heapq.heapify(self.queue)
+        if self.current and self.current.priority > 0:
             self.stop_playback()
             self.store.add("playback", {"outcome": "interrupted", "path": self.current.path})
+            self.finish(self.current, "interrupted")
             self.current = None
-        self.wake.set()
+
+    @staticmethod
+    def finish(message, outcome):
+        message.outcome = outcome
+        message.finished.set()
 
     def stop_playback(self):
         if os.name == "nt":
@@ -81,6 +125,10 @@ class AudioScheduler:
             winsound.PlaySound(None, 0)
 
     def clear(self):
+        for message in self.queue:
+            self.finish(message, "cancelled")
+        if self.current:
+            self.finish(self.current, "cancelled")
         self.queue.clear()
         self.stop_playback()
         self.current = None
@@ -97,11 +145,13 @@ class AudioScheduler:
                 if (self.muted or message.expires < time.monotonic() or
                         (message.session and message.session != self.session)):
                     self.store.add("playback", {"outcome": "suppressed", "path": message.path})
+                    self.finish(message, "suppressed")
                     continue
                 if self.recording:
                     if message.priority == 0:
                         # Caller cancels microphone before enqueuing critical warnings.
                         self.store.add("playback", {"outcome": "recording_blocked", "path": message.path})
+                        self.finish(message, "recording_blocked")
                         continue
                     heapq.heappush(self.queue, message)
                     await asyncio.sleep(0.05)
@@ -122,9 +172,11 @@ class AudioScheduler:
                     if self.current is message:
                         self.current = None
                         self.store.add("playback", {"outcome": "completed", "path": message.path})
+                        self.finish(message, "completed")
                 except (OSError, ValueError, EOFError, wave.Error):
                     self.current = None
                     self.store.add("playback", {"outcome": "failed", "path": message.path})
+                    self.finish(message, "failed")
         finally:
             self.clear()
 
@@ -145,3 +197,92 @@ def apply_volume(data, volume):
         dst.setparams(params)
         dst.writeframes(samples.tobytes())
     return out.getvalue()
+
+
+class AudioRenderer:
+    """Render source speech once into a deterministic, settings-aware cache.
+
+    Source clips are never modified. Cache identity includes the raw bytes,
+    fixed voice identity and every rendering control, so previews and playback
+    can share exactly the same processed WAV.
+    """
+
+    VERSION = "radio-render-v2-static"
+    EMOTION_SPEED = {
+        "neutral": 1.0,
+        "excited": 1.035,
+        "concerned": 0.985,
+        "urgent": 1.055,
+        "firm": 1.0,
+        "calm": 0.965,
+    }
+
+    def __init__(self, store):
+        self.store = store
+        self.cache_dir = Path(store.root) / "audio" / "radio-cache"
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+
+    def _settings(self, emotion):
+        settings = self.store.settings()
+        emotion = str(emotion or "neutral").strip().lower()
+        if emotion not in self.EMOTION_SPEED:
+            emotion = "neutral"
+        speed = float(settings.get("speech_speed", 1.18)) * self.EMOTION_SPEED[emotion]
+        strength = str(settings.get("radio_effect", "gritty")).lower()
+        if strength not in {"dry", "light", "gritty", "strong"}:
+            strength = "gritty"
+        volume = float(settings.get("volume", 0.8))
+        if not 0 <= volume <= 2:
+            raise ValueError("volume must be between 0 and 2")
+        return settings, emotion, speed, strength, volume
+
+    def _cache_path(self, data, emotion):
+        settings, emotion, speed, strength, volume = self._settings(emotion)
+        from .providers import voice_identity
+        identity = voice_identity(settings)
+        key = {
+            "version": self.VERSION,
+            "source_sha256": hashlib.sha256(data).hexdigest(),
+            "voice": identity,
+            "emotion": emotion,
+            "speed": speed,
+            "strength": strength,
+            "volume": volume,
+        }
+        digest = hashlib.sha256(json.dumps(key, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+        return self.cache_dir / f"{digest}.wav", speed, strength, volume
+
+    def render_bytes(self, data, emotion="neutral"):
+        data = bytes(data)
+        cache_path, speed, strength, volume = self._cache_path(data, emotion)
+        try:
+            return cache_path.read_bytes()
+        except FileNotFoundError:
+            pass
+        from .radiofx import process_radio
+        rendered = apply_volume(process_radio(data, speed=speed, strength=strength), volume)
+        # Atomic replacement prevents concurrent preview/playback renders from
+        # exposing a partially written WAV. The source recording is untouched.
+        fd, temporary = tempfile.mkstemp(prefix="radio-", suffix=".wav", dir=self.cache_dir)
+        try:
+            with os.fdopen(fd, "wb") as output:
+                output.write(rendered)
+            try:
+                os.link(temporary, cache_path)
+            except FileExistsError:
+                pass
+        finally:
+            try:
+                os.unlink(temporary)
+            except FileNotFoundError:
+                pass
+        return cache_path.read_bytes()
+
+    def render_file(self, path, emotion="neutral") -> Path:
+        """Render a source WAV and return its stable cached path."""
+        source = Path(path)
+        data = source.read_bytes()
+        cache_path, _, _, _ = self._cache_path(data, emotion)
+        if not cache_path.exists():
+            self.render_bytes(data, emotion=emotion)
+        return cache_path

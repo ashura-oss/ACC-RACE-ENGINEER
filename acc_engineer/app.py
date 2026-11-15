@@ -14,8 +14,11 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from .audio import AudioScheduler, apply_volume, seed_library
+from .audio import AudioRenderer, AudioScheduler, clip_emotion, seed_library
 from .engineering import EventEngine
+from .director import EngineerDirector
+from .memory import DriverMemory
+from .strategy import strategy_plan
 from .providers import OpenRouter, ProviderError, voice_identity
 from .setups import SetupManager
 from .storage import DEFAULTS, Store
@@ -29,7 +32,8 @@ class Settings(BaseModel):
     voice: str = Field(default="", max_length=200)
     weekly_budget_usd: float = Field(default=5, ge=0, le=1000)
     request_limit_usd: float = Field(default=.1, ge=0, le=10)
-    speech_speed: float = Field(default=1, ge=.5, le=2)
+    speech_speed: float = Field(default=1.18, ge=.5, le=2)
+    radio_effect: str = Field(default="gritty", pattern="^(dry|light|gritty|strong)$")
     volume: float = Field(default=.8, ge=0, le=1)
     commentary_frequency: str = Field(default="normal", pattern="^(off|low|normal|high)$")
     radio_button: str = Field(default="R3", pattern="^(R3|L3|A|B|X|Y|LB|RB|START|BACK)$")
@@ -64,11 +68,18 @@ class Runtime:
             self.store.save_settings({"recording_timeout_s": 30})
         seed_library(self.store)
         self.provider = OpenRouter(self.store)
-        self.audio = AudioScheduler(self.store)
+        self.provider.context_supplier = self.context
+        self.audio = AudioScheduler(self.store, AudioRenderer(self.store))
         self.engine = EventEngine(self.store.settings()["thresholds"])
+        self.memory = DriverMemory(self.store)
+        self.provider.memory_search = self.memory.search
+        self.director = EngineerDirector(config={"frequency": self.store.settings()["commentary_frequency"]}, profile=self.memory.profile())
+        self.last_call = None
+        self.follow_up_task = None
         self.reader = AccSharedMemory()
         self.broadcast = None
         self.running = False
+        self.live_available = False
         self.telemetry = None
         self.source = "disconnected"
         self.errors = []
@@ -84,6 +95,7 @@ class Runtime:
         self.radio_generation = 0
         self.transcriber = None
         self.response_tasks = set()
+        self.proactive_tasks = set()
         self.processing_task = None
         self.lifecycle_lock = asyncio.Lock()
 
@@ -112,6 +124,19 @@ class Runtime:
             self.error("Critical radio audio needs review for the selected voice: " + ", ".join(missing))
         self.generation += 1
         self.engine = EventEngine(self.store.settings()["thresholds"])
+        self.director = EngineerDirector(config={"frequency": self.store.settings()["commentary_frequency"]}, profile=self.memory.profile())
+        # Prepare processed warnings before polling: critical calls never wait on TTS.
+        for clip in self.store.clips():
+            identity = voice_identity(self.store.settings())
+            version = next((v for v in reversed(clip["versions"]) if v.get("approved") and
+                v.get("text") == clip["text"] and all(v.get(k) == x for k, x in identity.items())), None)
+            if version:
+                path = self.store.root / "audio" / (version["id"] + ".wav")
+                if path.is_file():
+                    try:
+                        await asyncio.to_thread(self.audio.renderer.render_file, path, clip_emotion(clip["id"]))
+                    except (OSError, ValueError, RuntimeError):
+                        self.error("A cached radio recording could not be prepared. Regenerate that recording in the library.")
         self.tasks = [asyncio.create_task(self.poll()), asyncio.create_task(self.audio.run())]
         settings = self.store.settings()
         if settings["broadcast_enabled"]:
@@ -123,6 +148,7 @@ class Runtime:
         await self.start_inputs()
 
     async def stop(self):
+        self.save_session_summary()
         self.running = False
         self.generation += 1
         await self.cancel_radio()
@@ -173,8 +199,15 @@ class Runtime:
                     await self.ingest(frame)
                 elif self.source == "acc":
                     self.source = "disconnected"
+                    self.live_available = False
+                    self.generation += 1
+                    self.audio.clear()
             except Exception:
+                if self.source == "acc":
+                    self.generation += 1
+                    self.audio.clear()
                 self.source = "disconnected"
+                self.live_available = False
             await asyncio.sleep(.05)
 
     async def ingest(self, frame):
@@ -182,14 +215,29 @@ class Runtime:
         self.telemetry = frame
         self.audio.session = str(frame.get("session_id", ""))
         if old_session and old_session != frame.get("session_id"):
+            self.save_session_summary()
             self.audio.clear()
             self.generation += 1
-        for event in self.engine.process(frame):
+        if self.source == "acc" and (frame.get("status") != "live" or frame.get("stale") or
+                                     frame.get("physics_valid") is False):
+            # ACC replays/menus/paused frames are displayable history, never
+            # live warning input. Isolated JSON replay uses its own EventEngine.
+            if self.live_available:
+                self.generation += 1
+                self.audio.clear()
+            self.live_available = False
+            return
+        self.live_available = True
+        events = self.engine.process(frame)
+        for event in events:
             event["session_id"] = frame.get("session_id")
             self.store.add("event", event)
-            await self.announce(event)
+        for intent in self.director.process(frame, events, self.engine.projection(frame)):
+            await self.announce(intent)
+        self.save_session_summary()
         if self.engine.fuel_history and len(self.engine.fuel_history) != getattr(self, "persisted_samples", 0):
             self.store.add("fuel_sample", {"session_id": frame.get("session_id"),
+                "car_model": frame.get("car_model"), "track": frame.get("track"),
                 "fuel_l": self.engine.fuel_history[-1], "lap_s": self.engine.lap_history[-1]})
             self.persisted_samples = len(self.engine.fuel_history)
         # Persist completed laps rather than every 20 Hz sample.
@@ -200,28 +248,85 @@ class Runtime:
             self.persisted_lap = lap
 
     async def announce(self, event):
+        was_running = self.running
         if event["priority"] == 3 and self.store.settings()["commentary_frequency"] == "off":
             return
-        clip_id = {"flag_yellow": "yellow", "flag_green": "green", "flag_blue": "blue",
+        if event["priority"] == 0:
+            await self.cancel_radio()
+            for task in list(self.response_tasks):
+                if task is not asyncio.current_task():
+                    task.cancel()
+            self.audio.interrupt_noncritical()
+        clip_id = event.get("clip_id") or {"flag_yellow": "yellow", "flag_green": "green", "flag_blue": "blue",
                    "flag_red": "red", "flag_checkered": "race_finish", "flag_chequered": "race_finish",
                    "low_fuel": "fuel_critical", "fuel_deficit": "fuel_low",
                    "severe_incident": "damage_severe", "damage": "damage_moderate",
                    "penalty_received": "penalty", "lap_invalidated": "invalid_lap",
                    "pit_window_opened": "pit_open", "session_started": "race_start", "session_finished": "race_finish",
                    "minor_damage": "damage_minor", "tyres_hot": "tyre_hot", "brakes_hot": "brake_hot"}.get(event["kind"], event["kind"])
-        clip = self.store.clip(clip_id)
+        if event["kind"] == "gap_behind_closing":
+            clip_id = "gap_behind_gaining"
+        clip = None if event.get("dynamic") else self.store.clip(clip_id)
+        self.last_call = {"text": event.get("text", (clip or {}).get("text", "")), "emotion": event.get("emotion", "calm"),
+            "kind": event["kind"], "timestamp": time.time()}
+        self.store.add("engineer_call", self.last_call | {"evidence": event.get("evidence", event.get("source")),
+            "session_id": self.audio.session})
         if clip:
             identity = voice_identity(self.store.settings())
             version = next((v for v in reversed(clip["versions"]) if v["approved"] and
                 v.get("voice") == identity["voice"] and v.get("speech_model") == identity["speech_model"] and
                 v.get("text") == clip["text"]), None)
             if version:
-                if event["priority"] == 0:
-                    await self.cancel_radio()
-                self.audio.enqueue(self.store.root / "audio" / (version["id"] + ".wav"),
-                                   event["priority"], session=self.audio.session)
+                generation, session = self.generation, self.audio.session
+                path = self.store.root / "audio" / (version["id"] + ".wav")
+                try:
+                    rendered = await asyncio.to_thread(self.audio.renderer.render_file, path, event.get("emotion", "calm"))
+                except (OSError, ValueError, RuntimeError):
+                    self.store.add("playback", {"outcome": "invalid_clip", "event": event["kind"]})
+                    return
+                if was_running and (not self.running or generation != self.generation or session != self.audio.session):
+                    return
+                if time.time() - event.get("timestamp", time.time()) > min(2, event.get("ttl", 8)):
+                    return
+                message = self.audio.enqueue(rendered, event["priority"], session=self.audio.session,
+                                   emotion=event.get("emotion", "calm"), prepared=True)
+                self.schedule_follow_up(self.last_call["text"], message)
                 return
+        if event["priority"] > 0 and self.running and not self.audio.muted and not self.audio.recording:
+            if not self.chat_lock.locked() and not self.response_tasks and len(self.audio.queue) < 2:
+                task = self.spawn(self.speak_intent(event, self.generation))
+                self.response_tasks.add(task)
+                self.proactive_tasks.add(task)
+                task.add_done_callback(self.response_tasks.discard)
+                task.add_done_callback(self.proactive_tasks.discard)
+            return
         self.store.add("playback", {"outcome": "missing_approved_clip", "event": event["kind"]})
+
+    async def speak_intent(self, intent, generation):
+        async with self.chat_lock:
+            if generation != self.generation or not self.running:
+                return
+            try:
+                data = await self.provider.speech(intent["text"], emotion=intent.get("emotion", "calm"))
+                if generation != self.generation or not self.running or self.audio.recording:
+                    return
+                if time.time() - intent.get("timestamp", time.time()) > intent.get("ttl", 10):
+                    return
+                path = self.store.root / "audio" / ("call-" + uuid.uuid4().hex + ".wav")
+                path.write_bytes(data)
+                message = self.audio.enqueue(path, intent["priority"], ttl=intent.get("ttl", 10),
+                    session=self.audio.session, emotion=intent.get("emotion", "calm"))
+                self.schedule_follow_up(intent["text"], message)
+            except (ProviderError, ValueError):
+                self.error("Proactive call text is available; speech generation unavailable.")
+
+    def save_session_summary(self):
+        if self.telemetry:
+            summary = self.director.session_summary()
+            if (summary.get("verified_final") and
+                    summary.get("session_id") != getattr(self, "saved_summary_session", None)):
+                self.memory.record_session(summary)
+                self.saved_summary_session = summary["session_id"]
 
     def audio_readiness(self):
         identity = voice_identity(self.store.settings())
@@ -240,20 +345,31 @@ class Runtime:
     def context(self, message=""):
         frame = self.telemetry or {}
         age = time.time()-frame.get("timestamp", 0)
-        fresh = age <= self.store.settings()["stale_after_s"] and frame.get("status") == "live" and self.source == "acc"
+        fresh = (age <= self.store.settings()["stale_after_s"] and frame.get("status") == "live" and
+                 self.source == "acc" and not frame.get("stale") and frame.get("physics_valid") is not False)
         session = frame.get("session_id")
-        return {"telemetry": frame if fresh else None, "telemetry_stale": not fresh,
+        result = {"telemetry": frame if fresh else None, "telemetry_stale": not fresh,
                 "source": self.source, "fuel_projection": self.engine.projection(frame) if fresh else {"status": "unknown"},
                 "competitors": self.broadcast.snapshot() if self.broadcast and fresh else None,
                 "events": [e for e in self.store.recent("event", 30) if e.get("session_id") == session][:8],
-                "conversation": [e for e in self.store.recent("conversation", 30) if e.get("session_id") == session][:6]}
+                "memory": self.memory.manifest(), "engineer_state": self.director.snapshot() | {"last_call": self.last_call}}
+        result["strategy"] = strategy_plan(result)
+        return result
 
-    async def chat(self, message):
+    async def chat(self, message, allow_follow_up=True):
         if not self.running:
             raise ValueError("Start the engineer before using the radio.")
         if self.chat_lock.locked():
-            raise ValueError("A radio response is already in progress.")
+            if self.proactive_tasks:
+                tasks = list(self.proactive_tasks)
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+            else:
+                raise ValueError("A radio response is already in progress.")
         async with self.chat_lock:
+            self.director.update_profile(self.memory.observe(message))
+            self.director.note_driver(message)
             generation = self.generation
             context = self.context(message)
             started = time.perf_counter()
@@ -262,6 +378,7 @@ class Runtime:
                 return {"text": "Response cancelled.", "suppressed": True}
             self.store.add("conversation", {"driver": message, "engineer": text,
                 "session_id": self.audio.session})
+            self.memory.remember_conversation(message, text, self.audio.session)
             self.store.add("activity", {"request": message, "response": text, "context": context,
                 "latency_ms": round((time.perf_counter()-started)*1000)})
             if generation != self.generation or not self.running:
@@ -269,12 +386,46 @@ class Runtime:
             try:
                 data = await self.provider.speech(text)
                 path = self.store.root / "audio" / ("reply-"+uuid.uuid4().hex+".wav")
-                path.write_bytes(apply_volume(data, self.store.settings()["volume"]))
+                path.write_bytes(data)
                 if generation == self.generation and self.running and time.perf_counter()-started < 20:
-                    self.audio.enqueue(path, 2, session=self.audio.session)
+                    message = self.audio.enqueue(path, 2, session=self.audio.session)
+                    if allow_follow_up:
+                        self.schedule_follow_up(text, message)
             except (ProviderError, ValueError):
                 self.error("Response text is available; speech generation unavailable.")
             return {"text": text}
+
+    def schedule_follow_up(self, text, message):
+        if (not hasattr(message, "finished") or "?" not in text or not self.store.settings()["follow_up_listening"] or
+                not self.recorder or (self.follow_up_task and not self.follow_up_task.done())):
+            return
+        self.follow_up_task = self.spawn(self.follow_up_window(self.generation, self.radio_generation, message))
+
+    async def follow_up_window(self, generation, radio_generation, message):
+        # Explicit opt-in only. Wait for output to finish so the mic cannot hear it.
+        deadline = time.monotonic() + 30
+        while not message.finished.is_set():
+            if (time.monotonic() > deadline or not self.running or generation != self.generation or
+                    radio_generation != self.radio_generation):
+                return
+            await asyncio.sleep(.1)
+        if message.outcome != "completed":
+            return
+        while self.audio.current or self.audio.queue or self.radio["state"] == "processing":
+            if (time.monotonic() > deadline or not self.running or generation != self.generation or
+                    radio_generation != self.radio_generation):
+                return
+            await asyncio.sleep(.1)
+        await asyncio.sleep(.25)
+        if (not self.running or generation != self.generation or radio_generation != self.radio_generation or
+                self.radio["state"] != "idle" or self.audio.muted or not self.store.settings()["follow_up_listening"]):
+            return
+        await self.toggle_radio()
+        self.radio["follow_up"] = True
+        listening_generation = self.radio_generation
+        await asyncio.sleep(5)
+        if self.radio["state"] == "recording" and listening_generation == self.radio_generation:
+            await self.toggle_radio()
 
     async def toggle_radio(self):
         async with self.radio_lock:
@@ -318,10 +469,12 @@ class Runtime:
             with contextlib.suppress(Exception):
                 self.recorder.cancel()
         self.radio["state"] = "idle"
+        self.radio.pop("follow_up", None)
         self.audio.recording = False
 
     async def transcribe_and_chat(self, audio, generation):
         from .controller import TranscriptionError
+        is_follow_up = self.radio.pop("follow_up", False)
         try:
             try:
                 text = await asyncio.to_thread(self.transcriber.transcribe, audio)
@@ -343,11 +496,16 @@ class Runtime:
             if generation != self.radio_generation or not self.running:
                 return
             if not text.strip():
+                if is_follow_up:
+                    return
                 self.radio["last_error"] = "No speech detected. Check the Windows default microphone and try again."
                 self.error(self.radio["last_error"])
                 return
             try:
-                await self.chat(text)
+                if is_follow_up:
+                    await self.chat(text, allow_follow_up=False)
+                else:
+                    await self.chat(text)
             except ProviderError as exc:
                 self.error("AI response failed: " + str(exc))
             except ValueError as exc:
@@ -406,6 +564,8 @@ def create_app(data_dir=None, api_token=None):
                 "model": runtime.store.settings()["model"], "speech_model": runtime.store.settings()["speech_model"],
                 "key_configured": bool(runtime.provider.key()), "configured": bool(runtime.provider.key())}, "spend_usd": runtime.store.spend(),
             "errors": runtime.errors, "broadcast": runtime.broadcast.snapshot() if runtime.broadcast else None,
+            "engineer": runtime.director.snapshot() | {"last_call": runtime.last_call},
+            "strategy": strategy_plan(runtime.context()),
             "fuel_projection": runtime.engine.projection(frame) if frame else {"status": "unknown"}}
 
     @app.post("/api/engineer/start")
@@ -438,12 +598,28 @@ def create_app(data_dir=None, api_token=None):
         values = body.model_dump(exclude_unset=True)
         if "voice" in values:
             values["voice"] = voice_identity(runtime.store.settings() | values)["voice"]
-        if values.get("follow_up_listening"):
-            raise ValueError("Automatic follow-up listening is not enabled in this release; use R3.")
         if values.get("broadcast_password") == "":
             values.pop("broadcast_password")
         runtime.store.save_settings(values)
         return await settings()
+
+    @app.get("/api/driver/profile")
+    async def driver_profile():
+        return runtime.memory.profile()
+
+    @app.put("/api/driver/profile")
+    async def save_driver_profile(body: dict):
+        profile = runtime.memory.update(body)
+        runtime.director.update_profile(profile)
+        return profile
+
+    @app.get("/api/driver/memory")
+    async def driver_memory():
+        return runtime.memory.context()
+
+    @app.get("/api/strategy")
+    async def strategy():
+        return strategy_plan(runtime.context())
 
     @app.post("/api/credentials")
     async def credentials(body: dict):
@@ -514,12 +690,13 @@ def create_app(data_dir=None, api_token=None):
     async def generate_clip(clip_id: str):
         clip = require_clip(clip_id)
         identity = voice_identity(runtime.store.settings())
-        data = await runtime.provider.speech(clip["text"])
+        emotion = clip_emotion(clip_id)
+        data = await runtime.provider.speech(clip["text"], emotion=emotion)
         version_id = uuid.uuid4().hex
-        (runtime.store.root / "audio" / (version_id+".wav")).write_bytes(apply_volume(data, runtime.store.settings()["volume"]))
+        (runtime.store.root / "audio" / (version_id+".wav")).write_bytes(data)
         latest = require_clip(clip_id)
         latest["versions"].append({"id": version_id, "approved": False, "text": clip["text"],
-            **identity, "timestamp": time.time(), "url": "/api/audio/"+version_id})
+            **identity, "emotion": emotion, "timestamp": time.time(), "url": "/api/audio/"+version_id})
         runtime.store.put_clip(latest)
         return latest
 
@@ -557,7 +734,14 @@ def create_app(data_dir=None, api_token=None):
         path = runtime.store.root / "audio" / (version_id+".wav")
         if not path.is_file():
             raise HTTPException(404)
-        return FileResponse(path, media_type="audio/wav")
+        emotion = "neutral"
+        for clip in runtime.store.clips():
+            version = next((v for v in clip["versions"] if v["id"] == version_id), None)
+            if version:
+                emotion = version.get("emotion", clip_emotion(clip["id"]))
+                break
+        rendered = await asyncio.to_thread(runtime.audio.renderer.render_file, path, emotion)
+        return FileResponse(rendered, media_type="audio/wav")
 
     @app.post("/api/chat")
     async def chat(body: Chat):
@@ -597,14 +781,21 @@ def create_app(data_dir=None, api_token=None):
             return {"text": "Visual analysis cancelled.", "suppressed": True}
 
     @app.get("/api/fuel/recommendation")
-    async def fuel_recommendation(duration_s: float = 900, reserve_l: float = 1):
+    async def fuel_recommendation(duration_s: float = 900, reserve_l: float = 1,
+                                  car_model: str = "", track: str = ""):
         from .engineering import fuel_projection
         if not 0 < duration_s <= 86400 or not 0 <= reserve_l <= 100:
             raise ValueError("Invalid race duration or fuel reserve")
-        samples = runtime.store.recent("fuel_sample", 10)
+        car_model = car_model or (runtime.telemetry or {}).get("car_model", "")
+        track = track or (runtime.telemetry or {}).get("track", "")
+        if not car_model or not track:
+            return {"status": "unknown", "reason": "Choose a car and track before using historical fuel measurements."}
+        samples = [s for s in runtime.store.recent("fuel_sample", 500)
+                   if s.get("car_model") == car_model and s.get("track") == track][:10]
         result = fuel_projection(0, [s["fuel_l"] for s in samples],
             [s["lap_s"] for s in samples], duration_s, reserve_l)
-        return result | {"note": "Historical samples may be from different cars/tracks. Verify the baseline before racing."}
+        return result | {"car_model": car_model, "track": track,
+                         "note": "Measured laps from this car and track only. Conditions and driving style can change consumption."}
 
     @app.get("/api/devices")
     async def devices():
@@ -649,8 +840,7 @@ def create_app(data_dir=None, api_token=None):
         text = "Radio check. Engineer online."
         data = await runtime.provider.speech(text)
         version_id = uuid.uuid4().hex
-        (runtime.store.root / "audio" / (version_id + ".wav")).write_bytes(
-            apply_volume(data, runtime.store.settings()["volume"]))
+        (runtime.store.root / "audio" / (version_id + ".wav")).write_bytes(data)
         return {"url": "/api/audio/" + version_id, "text": text}
 
     @app.post("/api/radio/cancel")

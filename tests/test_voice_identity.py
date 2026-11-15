@@ -71,7 +71,8 @@ def test_announce_plays_only_approved_clip_matching_current_voice_and_model(tmp_
     ]
     runtime.store.put_clip(clip)
     queued = []
-    monkeypatch.setattr(runtime.audio, "enqueue", lambda path, priority, session="": queued.append(path.name))
+    monkeypatch.setattr(runtime.audio.renderer, "render_file", lambda path, *args: path)
+    monkeypatch.setattr(runtime.audio, "enqueue", lambda path, priority, session="", **kwargs: queued.append(path.name))
 
     asyncio.run(runtime.announce({"kind": "flag_yellow", "priority": 0}))
 
@@ -101,7 +102,7 @@ def test_voice_or_model_change_during_generation_makes_version_unapprovable(tmp_
     runtime = app.state.runtime
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def controlled_speech(_text):
+    async def controlled_speech(_text, **kwargs):
         entered.set()
         await release.wait()
         return _wav_bytes()
@@ -133,7 +134,7 @@ def test_script_change_during_generation_keeps_recording_unapprovable(tmp_path):
     runtime = app.state.runtime
     entered, release = asyncio.Event(), asyncio.Event()
 
-    async def controlled_speech(_text):
+    async def controlled_speech(_text, **kwargs):
         entered.set()
         await release.wait()
         return _wav_bytes()

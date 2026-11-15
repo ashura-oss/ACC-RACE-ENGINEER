@@ -56,8 +56,10 @@ class EventEngine:
     def __init__(self, config: dict | None = None):
         self.config = self.DEFAULTS | (config or {})
         for key, value in self.config.items():
-            if key not in self.DEFAULTS or number(value) is None or value < 0:
+            parsed = number(value)
+            if key not in self.DEFAULTS or parsed is None or parsed < 0:
                 raise ValueError(f"Invalid event threshold: {key}")
+            self.config[key] = parsed
         self.session_id = None
         self.previous: dict | None = None
         self.cooldowns: dict[str, float] = {}
@@ -138,7 +140,7 @@ class EventEngine:
         # old frame cannot be compared across the stale telemetry cutoff.
         for field, direction, kind, text in (
             ("gap_ahead_s", "down", "gap_ahead_closing", "The gap ahead is coming down."),
-            ("gap_behind_s", "up", "gap_behind_gaining", "The car behind is closing in."),
+            ("gap_behind_s", "down", "gap_behind_closing", "The car behind is closing in."),
         ):
             gap = number(snapshot.get(field))
             samples = self.gap_history[field]

@@ -28,6 +28,13 @@ def test_projection_uses_fastest_lap_max_consumption_and_finishing_lap():
     assert result["surplus_l"] == 11.5
 
 
+@pytest.mark.parametrize("config", [{"cooldown_s": -1}, {"unknown_limit": 1},
+                                     {"stale_after_s": float("nan")}, {"cooldown_s": True}])
+def test_invalid_engine_thresholds_fail_with_value_error(config):
+    with pytest.raises(ValueError, match="Invalid event threshold"):
+        EventEngine(config)
+
+
 @pytest.mark.parametrize("fuel,remaining,consumption,times", [
     (None, 300, [2], [100]), (20, None, [2], [100]),
     (20, 300, [], [100]), (20, 300, [2], []),
@@ -132,15 +139,52 @@ def test_transition_events_require_explicit_edges_and_rain_measurement_change():
 def test_gap_trend_requires_sustained_window_and_resets_per_session():
     engine = EventEngine({"stale_after_s": 10, "gap_trend_threshold_s": .5})
     now = time.time()
-    engine.process(frame(timestamp=now - 5.2, gap_ahead_s=4, gap_behind_s=3))
+    engine.process(frame(timestamp=now - 5.2, gap_ahead_s=4, gap_behind_s=4))
     # Fresh intermediate frames preserve the measured trend through the stale cutoff.
-    assert engine.process(frame(timestamp=now - 2.6, gap_ahead_s=3.8, gap_behind_s=3.2)) == []
-    events = engine.process(frame(timestamp=now, gap_ahead_s=3.2, gap_behind_s=3.8))
-    assert {event["kind"] for event in events} == {"gap_ahead_closing", "gap_behind_gaining"}
+    assert engine.process(frame(timestamp=now - 2.6, gap_ahead_s=3.8, gap_behind_s=3.8)) == []
+    events = engine.process(frame(timestamp=now, gap_ahead_s=3.2, gap_behind_s=3.2))
+    assert {event["kind"] for event in events} == {"gap_ahead_closing", "gap_behind_closing"}
     assert all(event["source"]["window_s"] >= 5 for event in events)
     # A session reset clears anchors; no trend can bridge sessions.
     assert engine.process(frame(timestamp=now + .1, session_id="race2",
                                  gap_ahead_s=3, gap_behind_s=4)) == []
+
+
+def test_gap_increase_and_missing_samples_never_claim_car_behind_is_closing():
+    engine = EventEngine({"stale_after_s": 10, "gap_trend_window_s": 0.1})
+    now = time.time()
+    engine.process(frame(timestamp=now - .2, gap_behind_s=2))
+    engine.process(frame(timestamp=now, gap_behind_s=None))
+    events = engine.process(frame(timestamp=now + .2, gap_behind_s=3))
+    assert not any(event["kind"] == "gap_behind_closing" for event in events)
+    # A session reset makes the following sustained decrease an independent trend.
+    engine.process(frame(timestamp=now + .3, session_id="race2", gap_behind_s=3))
+    events = engine.process(frame(timestamp=now + .5, session_id="race2", gap_behind_s=2.3))
+    assert [event["kind"] for event in events] == ["gap_behind_closing"]
+    assert events[0]["source"]["change_s"] == pytest.approx(-0.7)
+
+
+def test_events_are_sorted_by_priority_and_cooldown_is_per_kind():
+    engine = EventEngine()
+    now = time.time()
+    engine.process(frame(timestamp=now, flag="none", fuel_l=30))
+    events = engine.process(frame(timestamp=now + .1, flag="yellow", fuel_l=0))
+    assert [event["kind"] for event in events] == ["flag_yellow", "low_fuel"]
+    assert [event["priority"] for event in events] == [0, 0]
+    assert engine.process(frame(timestamp=now + .2, flag="yellow", fuel_l=0)) == []
+    engine.process(frame(timestamp=now + .3, flag="none", fuel_l=30))
+    assert [e["kind"] for e in engine.process(frame(timestamp=now + .4, flag="yellow", fuel_l=30))] == ["flag_yellow"]
+
+
+def test_invalid_damage_evidence_is_ignored_and_moderate_damage_has_delta_evidence():
+    engine = EventEngine()
+    now = time.time()
+    engine.process(frame(timestamp=now, damage=[0, 0, 0, 0]))
+    assert engine.process(frame(timestamp=now + .1, damage=[float("nan"), 0, 0, 0])) == []
+    engine.process(frame(timestamp=now + .2, damage=[0, 0, 0, 0]))
+    events = engine.process(frame(timestamp=now + .3, damage=[2, 2, 0, 0]))
+    assert events[0]["kind"] == "damage"
+    assert events[0]["source"]["damage_delta"] == [2, 2, 0, 0]
 
 
 def test_cooldown_rules_rearm_only_on_transition():

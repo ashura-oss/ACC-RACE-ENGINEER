@@ -1,12 +1,28 @@
 """Read-only deterministic race-data tools exposed to the model."""
 from __future__ import annotations
 
+import math
 import time
 from copy import deepcopy
 
 
 def _unknown(reason: str) -> dict:
     return {"status": "unknown", "reason": reason}
+
+
+def _finite_number(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(float(value))
+    except (TypeError, ValueError, OverflowError):
+        return False
+
+
+def _has_measurement(value) -> bool:
+    if isinstance(value, (list, tuple)):
+        return any(_finite_number(item) for item in value)
+    return _finite_number(value)
 
 
 class RaceTools:
@@ -21,13 +37,11 @@ class RaceTools:
         if not isinstance(frame, dict) or ctx.get("telemetry_stale", False):
             return None
         stamp = frame.get("timestamp")
-        if stamp is not None:
-            try:
-                age = time.time() - float(stamp)
-            except (TypeError, ValueError):
-                return None
-            if age < -1 or age > 2:
-                return None
+        if not _finite_number(stamp):
+            return None
+        age = time.time() - float(stamp)
+        if age < -1 or age > 2:
+            return None
         if frame.get("stale") is True:
             return None
         return frame
@@ -37,7 +51,7 @@ class RaceTools:
         if f is None:
             return _unknown("Fresh telemetry is unavailable.")
         pressure, temp = f.get("tyre_pressure_psi"), f.get("tyre_temp_c")
-        if pressure is None and temp is None:
+        if not _has_measurement(pressure) and not _has_measurement(temp):
             return _unknown("Tyre readings are unavailable.")
         return {"status": "available", "pressure_psi": deepcopy(pressure), "core_temp_c": deepcopy(temp)}
 
@@ -53,7 +67,8 @@ class RaceTools:
         f = self._frame()
         if f is None:
             return _unknown("Fresh telemetry is unavailable.")
-        gaps = {"ahead_s": f.get("gap_ahead_s"), "behind_s": f.get("gap_behind_s")}
+        gaps = {"ahead_s": f.get("gap_ahead_s") if _finite_number(f.get("gap_ahead_s")) else None,
+                "behind_s": f.get("gap_behind_s") if _finite_number(f.get("gap_behind_s")) else None}
         competitors = self.context.get("competitors")
         if isinstance(competitors, dict):
             cars = competitors.get("competitors")
@@ -80,7 +95,7 @@ class RaceTools:
         if f is None:
             return _unknown("Fresh telemetry is unavailable.")
         keys = ("ambient_temp_c", "track_temp_c", "rain_intensity", "rain_10min", "rain_30min")
-        values = {k: f[k] for k in keys if f.get(k) is not None}
+        values = {k: f[k] for k in keys if _finite_number(f.get(k))}
         if not values:
             return _unknown("Weather readings are unavailable.")
         return {"status": "available", **values}
@@ -90,10 +105,15 @@ class RaceTools:
         if f is None:
             return _unknown("Fresh telemetry is unavailable.")
         last, best = f.get("last_lap_ms"), f.get("best_lap_ms")
-        if not isinstance(last, (int, float)) or not isinstance(best, (int, float)) or last <= 0 or best <= 0:
+        if not _finite_number(last) or not _finite_number(best) or float(last) <= 0 or float(best) <= 0:
             return _unknown("Completed lap and best lap times are unavailable.")
-        return {"status": "available", "last_lap_ms": last, "best_lap_ms": best,
-                "delta_to_best_ms": last - best, "lap_valid": f.get("lap_valid")}
+        last_ms, best_ms = float(last), float(best)
+        return {"status": "available", "last_lap_ms": last_ms, "best_lap_ms": best_ms,
+                "delta_to_best_ms": last_ms - best_ms, "lap_valid": f.get("lap_valid")}
+
+    def get_strategy_plan(self) -> dict:
+        from .strategy import strategy_plan
+        return strategy_plan(self.context)
 
 
 TOOL_DEFINITIONS = [
@@ -106,16 +126,32 @@ TOOL_DEFINITIONS = [
         ("get_recent_incidents", "Read recent detected damage or incident events."),
         ("get_weather_forecast", "Read current and ACC-provided near-term weather readings."),
         ("get_lap_comparison", "Compare last completed lap with the recorded best."),
+        ("get_strategy_plan", "Read the measured fuel, tyre, brake and weather plan; unknown pit strategy remains unknown."),
     )
 ]
 
+TOOL_DEFINITIONS.append({"type": "function", "function": {
+    "name": "search_driver_memory",
+    "description": "Search persistent local driver memory when you need a name, preference, or past session/conversation. Retrieve only what this question needs; past assistant statements are not verified current telemetry.",
+    "parameters": {"type": "object", "properties": {
+        "query": {"type": "string", "minLength": 1, "maxLength": 200},
+        "limit": {"type": "integer", "minimum": 1, "maximum": 8}},
+        "required": ["query"], "additionalProperties": False}}})
+
 _METHODS = {name: getattr(RaceTools, name) for name in (
     "get_tyre_status", "get_fuel_projection", "get_competitor_gaps",
-    "get_recent_incidents", "get_weather_forecast", "get_lap_comparison")}
+    "get_recent_incidents", "get_weather_forecast", "get_lap_comparison", "get_strategy_plan")}
 
 
-def execute(name: str, args: dict, context: dict | None = None) -> dict:
+def execute(name: str, args: dict, context: dict | None = None, memory_search=None) -> dict:
     """Execute a whitelisted, argument-free read-only tool."""
+    if name == "search_driver_memory":
+        if not callable(memory_search) or not isinstance(args, dict) or set(args) - {"query", "limit"}:
+            return _unknown("Local memory search is unavailable or arguments are invalid.")
+        query, limit = args.get("query"), args.get("limit", 5)
+        if not isinstance(query, str) or not 1 <= len(query.strip()) <= 200 or isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 8:
+            return _unknown("Memory search needs a query and a limit between one and eight.")
+        return {"status": "available", "results": memory_search(query, limit=limit)}
     method = _METHODS.get(name)
     if method is None:
         return _unknown("Tool is not available.")

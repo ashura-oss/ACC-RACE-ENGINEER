@@ -8,7 +8,7 @@ import pytest
 
 from acc_engineer.controller import ButtonEdge, ControllerService
 from acc_engineer import telemetry
-from acc_engineer.telemetry import AccSharedMemory, BroadcastingClient, Graphics, Physics, parse_broadcast_packet, registration_packet
+from acc_engineer.telemetry import AccSharedMemory, BroadcastingClient, Graphics, Physics, StaticPrefix, parse_broadcast_packet, registration_packet
 
 
 def test_shared_memory_offsets_are_windows_sdk_offsets():
@@ -19,6 +19,220 @@ def test_shared_memory_offsets_are_windows_sdk_offsets():
     assert Physics.wheelsPressure.offset == 88
     assert Physics.brakeTemp.offset == 348
     assert ctypes.sizeof(Graphics) == 1588
+
+
+def test_shared_memory_maps_confirmed_session_and_flag_fields(monkeypatch):
+    class FakeMapping:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    p, g = Physics(), Graphics()
+    p.gear, p.speedKmh, p.rpms = 2, 124.5, 5100
+    g.session, g.sessionIndex, g.status = 2, 3, 2
+    g.sessionTimeLeft, g.completedLaps, g.isValidLap = 900000.0, 4, 0
+    g.iLastTime = g.iBestTime = 2147483647
+    g.isSetupMenuVisible = 1
+    g.isInPit, g.isInPitLane = 1, 1
+    g.GlobalYellow, g.GlobalYellow2, g.GlobalRed = 1, 1, 0
+    reader = AccSharedMemory()
+    reader._maps = [FakeMapping(bytes(p)), FakeMapping(bytes(g))]
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+
+    sample = reader.read()
+
+    assert sample["session"] == "race"
+    assert sample["is_setup_menu_visible"] is True
+    assert sample["session_time_left_s"] == 900.0
+    assert sample["last_lap_ms"] is None and sample["best_lap_ms"] is None
+    assert sample["lap_valid"] is False
+    assert sample["invalid_lap"] is True
+    assert sample["in_pit"] and sample["in_pit_lane"]
+    assert sample["global_flags"] == {
+        "yellow": True, "yellow_1": False, "yellow_2": True, "yellow_3": False,
+        "white": False, "green": False, "chequered": False, "red": False,
+    }
+
+
+def test_shared_memory_session_id_changes_on_session_reset(monkeypatch):
+    class FakeMapping:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    p, g = Physics(), Graphics()
+    p.packetId = 1
+    g.packetId, g.session, g.sessionIndex, g.completedLaps = 1, 2, 0, 0
+    reader = AccSharedMemory()
+    physics, graphics = FakeMapping(bytes(p)), FakeMapping(bytes(g))
+    reader._maps = [physics, graphics]
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+    first = reader.read()["session_id"]
+
+    g.sessionIndex = 1
+    graphics.payload = bytes(g)
+    second = reader.read()["session_id"]
+
+    assert first != second
+
+
+def test_static_identity_is_optional_and_normalized(monkeypatch):
+    class FakeMapping:
+        def __init__(self, name, size):
+            if name.endswith("acpmf_static"):
+                raise OSError(2, "optional static mapping absent")
+            self.payload = bytes(size)
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(telemetry, "_WindowsMapping", FakeMapping)
+    reader = AccSharedMemory()
+
+    sample = reader.read()
+
+    assert sample is not None
+    assert sample["car_model"] is None
+    assert sample["track"] is None
+    assert reader.error is None
+
+
+def test_static_prefix_reads_only_documented_car_and_track(monkeypatch):
+    class FakeMapping:
+        def __init__(self, name, size):
+            if name.endswith("acpmf_static"):
+                metadata = StaticPrefix()
+                for field, value in (("carModel", "McLaren_720s_GT3"), ("track", "Barcelona")):
+                    target = getattr(metadata, field)
+                    for index, character in enumerate(value):
+                        target[index] = ord(character)
+                self.payload = bytes(metadata)
+            else:
+                self.payload = bytes(size)
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+    monkeypatch.setattr(telemetry, "_WindowsMapping", FakeMapping)
+    reader = AccSharedMemory()
+
+    sample = reader.read()
+
+    assert ctypes.sizeof(StaticPrefix) == 200
+    assert sample["car_model"] == "mclaren_720s_gt3"
+    assert sample["track"] == "barcelona"
+
+
+def test_all_zero_physics_page_is_not_exposed_as_a_real_measurement(monkeypatch):
+    class FakeMapping:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    p, g = Physics(), Graphics()
+    p.packetId, g.packetId = 10, 20
+    g.status, g.sessionTimeLeft = 2, 600000
+    reader = AccSharedMemory()
+    reader._maps = [FakeMapping(bytes(p)), FakeMapping(bytes(g))]
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+
+    sample = reader.read()
+
+    assert sample["status"] == "live"
+    assert sample["physics_valid"] is False
+    assert sample["stale"] is False
+    assert sample["physics_age_s"] is not None
+    assert sample["speed_kmh"] is None
+    assert sample["rpm"] is None
+    assert sample["fuel_l"] is None
+    assert sample["tyre_pressure_psi"] is None
+
+
+def test_zero_fuel_is_preserved_when_other_physics_signals_are_valid(monkeypatch):
+    class FakeMapping:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    p, g = Physics(), Graphics()
+    p.packetId, p.speedKmh, p.rpms, p.fuel = 11, 5.0, 900, 0.0
+    for wheel in range(4):
+        p.wheelsPressure[wheel] = 27.5
+    g.packetId, g.status = 21, 2
+    reader = AccSharedMemory()
+    reader._maps = [FakeMapping(bytes(p)), FakeMapping(bytes(g))]
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+
+    sample = reader.read()
+
+    assert sample["physics_valid"] is True
+    assert sample["fuel_l"] == 0.0
+    assert sample["speed_kmh"] == 5.0
+
+
+def test_frozen_physics_page_ages_even_while_graphics_updates(monkeypatch):
+    class FakeMapping:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def read(self):
+            return self.payload
+
+        def close(self):
+            pass
+
+    p, g = Physics(), Graphics()
+    p.packetId, p.speedKmh, p.rpms, p.fuel = 12, 80.0, 4000, 20.0
+    g.packetId, g.status, g.sessionTimeLeft = 22, 2, 600000
+    physics, graphics = FakeMapping(bytes(p)), FakeMapping(bytes(g))
+    reader = AccSharedMemory(stale_after_s=.02)
+    reader._maps = [physics, graphics]
+    monkeypatch.setattr(telemetry, "os", SimpleNamespace(name="nt"))
+    first = reader.read()
+    assert first["physics_valid"] is True
+    assert first["stale"] is False
+
+    time.sleep(.03)
+    g.packetId += 1
+    g.sessionTimeLeft -= 1000
+    graphics.payload = bytes(g)
+    second = reader.read()
+
+    assert second["status"] == "live"
+    assert second["graphics_age_s"] < .02
+    assert second["physics_age_s"] > .02
+    assert second["stale"] is True
+    assert second["physics_valid"] is False
+    assert second["fuel_l"] is None
+    assert second["speed_kmh"] is None
 
 
 def test_button_hold_bounce_release_and_repress():

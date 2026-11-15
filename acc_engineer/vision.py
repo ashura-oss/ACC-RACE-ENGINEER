@@ -9,7 +9,7 @@ import os
 def _acc_window_region():
     """Return (foreground HWND, primary-monitor client rect) for ACC, else None."""
     if os.name != "nt":
-        return False
+        return None
     import ctypes
     from ctypes import wintypes
 
@@ -31,21 +31,21 @@ def _acc_window_region():
     kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
     hwnd = user32.GetForegroundWindow()
     if not hwnd or user32.IsIconic(hwnd):
-        return False
+        return None
     pid = wintypes.DWORD()
     user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     if not pid.value:
-        return False
+        return None
     PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
     if not handle:
-        return False
+        return None
     try:
         size = wintypes.DWORD(32768)
         buf = ctypes.create_unicode_buffer(size.value)
         query = kernel32.QueryFullProcessImageNameW
         if not query(handle, 0, buf, ctypes.byref(size)):
-            return False
+            return None
         if os.path.basename(buf.value).casefold() not in {"ac2-win64-shipping.exe", "acc.exe"}:
             return None
     finally:

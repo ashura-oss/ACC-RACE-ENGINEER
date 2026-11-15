@@ -112,7 +112,8 @@ def test_critical_event_kinds_resolve_approved_clips(tmp_path, monkeypatch):
     with TestClient(create_app(tmp_path)) as client:
         runtime = client.app.state.runtime
         queued = []
-        monkeypatch.setattr(runtime.audio, "enqueue", lambda path, priority, session="": queued.append((str(path), priority, session)))
+        monkeypatch.setattr(runtime.audio.renderer, "render_file", lambda path, *args: path)
+        monkeypatch.setattr(runtime.audio, "enqueue", lambda path, priority, session="", **kwargs: queued.append((str(path), priority, session)))
         cases = [("flag_yellow", "yellow"), ("flag_red", "red"),
                  ("low_fuel", "fuel_critical"), ("severe_incident", "damage_severe")]
         async def exercise():

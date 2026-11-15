@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import ctypes as c
+import math
 import os
 import struct
 import time
@@ -72,6 +73,25 @@ class Graphics(c.LittleEndianStructure):
     ]
 
 
+class StaticPrefix(c.LittleEndianStructure):
+    """Documented static-page prefix through track; excludes driver details."""
+    _pack_ = 4
+    _fields_ = [
+        ('smVersion', W*15), ('acVersion', W*15), ('numberOfSessions', I),
+        ('numCars', I), ('carModel', W*33), ('track', W*33),
+    ]
+
+
+def _wide_string(value):
+    raw = c.string_at(c.addressof(value), c.sizeof(value))
+    return raw.decode('utf-16-le', 'replace').split('\0', 1)[0].strip()
+
+
+def _identity(value):
+    normalized = '_'.join(value.casefold().split())
+    return normalized or None
+
+
 class _WindowsMapping:
     def __init__(self, name, size):
         from ctypes import wintypes
@@ -110,11 +130,16 @@ class AccSharedMemory:
         self._lock = threading.RLock()
         self.stale_after_s = stale_after_s
         self._maps = []
-        self._packet = None
-        self._updated = 0.0
+        self._last_physics_packet = None
+        self._last_graphics_packet = None
+        self._physics_updated = None
+        self._graphics_updated = None
         self._session_epoch = time.time_ns()
         self._last_laps = 0
+        self._session_key = None
         self.error = None
+        self._owns_maps = False
+        self._static_retry_at = 0.0
 
     def read(self):
         with self._lock:
@@ -128,37 +153,94 @@ class AccSharedMemory:
             if not self._maps:
                 for name, layout in [('Local\\acpmf_physics', Physics), ('Local\\acpmf_graphics', Graphics)]:
                     self._maps.append(_WindowsMapping(name, c.sizeof(layout)))
+                self._owns_maps = True
+            if self._owns_maps and len(self._maps) == 2 and time.monotonic() >= self._static_retry_at:
+                # Static metadata is optional and can be published later than the
+                # live pages. Retry slowly; its absence never disables telemetry.
+                self._static_retry_at = time.monotonic() + 1.0
+                try:
+                    self._maps.append(_WindowsMapping('Local\\acpmf_static', c.sizeof(StaticPrefix)))
+                except OSError:
+                    pass
             p = Physics.from_buffer_copy(self._maps[0].read())
             g = Graphics.from_buffer_copy(self._maps[1].read())
+            static = None
+            if len(self._maps) > 2:
+                try:
+                    static = StaticPrefix.from_buffer_copy(self._maps[2].read())
+                except OSError:
+                    self._maps[2].close()
+                    self._maps.pop()
             now = time.time()
-            packet = (p.packetId, g.packetId)
-            if packet != self._packet:
-                self._packet, self._updated = packet, now
-            if g.completedLaps < self._last_laps:
+            if p.packetId != self._last_physics_packet:
+                self._last_physics_packet, self._physics_updated = p.packetId, now
+            if g.packetId != self._last_graphics_packet:
+                self._last_graphics_packet, self._graphics_updated = g.packetId, now
+            physics_age = max(0.0, now-self._physics_updated) if self._physics_updated is not None else None
+            graphics_age = max(0.0, now-self._graphics_updated) if self._graphics_updated is not None else None
+            # A newly mapped all-zero physics page is not a believable car
+            # sample. Keep zero fuel valid when other physics signals exist.
+            physics_signals = (p.speedKmh, p.rpms, p.gear, p.fuel, p.gas, p.brake,
+                               *p.accG, *p.wheelsPressure, *p.tyreCoreTemperature,
+                               *p.brakeTemp)
+            has_physics_data = any(math.isfinite(float(value)) and value != 0 for value in physics_signals)
+            physics_valid = (physics_age is not None and physics_age <= self.stale_after_s
+                             and has_physics_data)
+            stale = (physics_age is None or graphics_age is None
+                     or physics_age > self.stale_after_s or graphics_age > self.stale_after_s)
+            timestamp = min(self._physics_updated, self._graphics_updated) if not stale else min(
+                t for t in (self._physics_updated, self._graphics_updated) if t is not None)
+            session_key = (g.sessionIndex, g.session)
+            if session_key != self._session_key or g.completedLaps < self._last_laps:
                 self._session_epoch = time.time_ns()
+            self._session_key = session_key
             self._last_laps = g.completedLaps
             self.error = None
             return {
-                'timestamp': self._updated, 'received_at': now,
-                'stale': now-self._updated > self.stale_after_s,
+                'timestamp': timestamp, 'received_at': now, 'stale': stale,
+                'physics_valid': physics_valid, 'physics_age_s': physics_age,
+                'graphics_age_s': graphics_age,
+                'physics_packet_id': p.packetId, 'graphics_packet_id': g.packetId,
                 'session_id': f'{self._session_epoch}:{g.sessionIndex}:{g.session}',
                 'status': {0:'off', 1:'replay', 2:'live', 3:'paused'}.get(g.status, 'unknown'),
-                'speed_kmh': p.speedKmh, 'rpm': p.rpms, 'gear': p.gear-1,
-                'fuel_l': p.fuel, 'fuel_per_lap_l': g.fuelXLap,
+                'car_model': _identity(_wide_string(static.carModel)) if static else None,
+                'track': _identity(_wide_string(static.track)) if static else None,
+                'is_setup_menu_visible': bool(g.isSetupMenuVisible),
+                'session': {-1:'unknown', 0:'practice', 1:'qualifying', 2:'race', 3:'hotlap',
+                            4:'time_attack', 5:'drift', 6:'drag', 7:'hotstint',
+                            8:'hotstint_superpole'}.get(g.session, 'unknown'),
+                'speed_kmh': p.speedKmh if physics_valid else None,
+                'rpm': p.rpms if physics_valid else None,
+                'gear': p.gear-1 if physics_valid else None,
+                'fuel_l': p.fuel if physics_valid else None, 'fuel_per_lap_l': g.fuelXLap,
                 'completed_laps': g.completedLaps, 'current_lap_ms': g.iCurrentTime,
-                'last_lap_ms': g.iLastTime, 'best_lap_ms': g.iBestTime,
+                'last_lap_ms': None if g.iLastTime == 2147483647 else g.iLastTime,
+                'best_lap_ms': None if g.iBestTime == 2147483647 else g.iBestTime,
+                # The SDK PDF omits the unit. A live 10-minute quick race read
+                # 600000 here, so ACC encodes milliseconds like its i*Time fields.
                 'session_time_left_s': g.sessionTimeLeft/1000,
                 'position': g.position, 'player_car_id': g.playerCarID,
                 'flag': {0:'none',1:'blue',2:'yellow',3:'black',4:'white',5:'chequered',6:'penalty',7:'green',8:'orange'}.get(g.flag, 'unknown'),
                 'penalty': g.penalty, 'lap_valid': bool(g.isValidLap),
-                'damage': list(p.carDamage), 'tyre_pressure_psi': list(p.wheelsPressure),
-                'tyre_temp_c': list(p.tyreCoreTemperature), 'brake_temp_c': list(p.brakeTemp),
-                'acceleration_g': list(p.accG), 'ambient_temp_c': p.airTemp,
-                'track_temp_c': p.roadTemp, 'rain_intensity': g.rainIntensity,
+                'invalid_lap': not bool(g.isValidLap),
+                'damage': list(p.carDamage) if physics_valid else None,
+                'tyre_pressure_psi': list(p.wheelsPressure) if physics_valid else None,
+                'tyre_temp_c': list(p.tyreCoreTemperature) if physics_valid else None,
+                'brake_temp_c': list(p.brakeTemp) if physics_valid else None,
+                'acceleration_g': list(p.accG) if physics_valid else None,
+                'ambient_temp_c': p.airTemp if physics_valid else None,
+                'track_temp_c': p.roadTemp if physics_valid else None, 'rain_intensity': g.rainIntensity,
                 'rain_10min': g.rainIntensityIn10min, 'rain_30min': g.rainIntensityIn30min,
                 'gap_ahead_s': g.gapAhead/1000 if g.gapAhead > 0 else None,
                 'gap_behind_s': g.gapBehind/1000 if g.gapBehind > 0 else None,
-                'in_pit': bool(g.isInPitLane), 'tc': g.TC, 'abs': g.ABS,
+                'in_pit': bool(g.isInPit), 'in_pit_lane': bool(g.isInPitLane),
+                'global_flags': {
+                    'yellow': bool(g.GlobalYellow), 'yellow_1': bool(g.GlobalYellow1),
+                    'yellow_2': bool(g.GlobalYellow2), 'yellow_3': bool(g.GlobalYellow3),
+                    'white': bool(g.GlobalWhite), 'green': bool(g.GlobalGreen),
+                    'chequered': bool(g.GlobalChequered), 'red': bool(g.GlobalRed),
+                },
+                'tc': g.TC, 'abs': g.ABS,
                 'source': 'acc_shared_memory',
             }
         except (OSError, ValueError) as exc:
@@ -171,7 +253,14 @@ class AccSharedMemory:
             for mapping in self._maps:
                 mapping.close()
             self._maps.clear()
-            self._packet = None
+            self._owns_maps = False
+            self._static_retry_at = 0.0
+            self._last_physics_packet = None
+            self._last_graphics_packet = None
+            self._session_key = None
+            self._last_laps = 0
+            self._physics_updated = None
+            self._graphics_updated = None
 
 
 class PacketReader:

@@ -112,3 +112,12 @@ def test_unknown_pricing_dimension_still_fails_closed(tmp_path, monkeypatch):
     assert store.recent("usage") == []
     asyncio.run(provider.client.aclose())
     store.close()
+
+
+def test_local_memory_search_tool_is_not_billed_as_web_search(tmp_path, monkeypatch):
+    from acc_engineer.tools import TOOL_DEFINITIONS
+    store, provider, model = _provider_with_pricing(tmp_path, monkeypatch, LUNA_PRICING)
+    asyncio.run(provider._post(model, "/chat/completions", {"tools": TOOL_DEFINITIONS}, max_tokens=20))
+    assert len(store.recent("usage")) == 1
+    asyncio.run(provider.client.aclose())
+    store.close()

@@ -4,8 +4,31 @@ The shared-memory layout uses the Kunos ACC shared-memory v1.8.12 ABI, 4-byte
 packing, fixed-width 32-bit numbers and 16-bit Windows UTF-16 code units.
 Only existing read-only mappings are opened; the app never creates game pages.
 Physics and graphics are copied with packet checks independently; they are not
-an atomic cross-page snapshot. Source timestamps advance only when packet IDs
-change. After two seconds without updates, the sample is marked stale.
+an atomic cross-page snapshot. The optional static page reads only its first
+200 bytes (`smVersion`, `acVersion`, session/car counts, car model and track).
+Missing static metadata does not disable live telemetry. Car and track identity
+is trimmed, case-folded and normalized to underscores. Source timestamps
+advance only when their packet IDs change. After two seconds without updates to
+either page, the sample is marked stale.
+
+Physics and graphics packet counters have independent freshness timestamps.
+The combined `timestamp` uses the older page, and the frame becomes stale when
+either page stops advancing. `physics_valid` is false when the physics page is
+stale or every checked car signal is zero; physics measurements then become
+`null`. An actual zero fuel reading remains available when another car signal
+confirms a populated physics page.
+
+The SDK documents graphics `sessionTimeLeft` as a float but does not specify its
+unit. A live 10-minute Quick Race returned `600000`, matching milliseconds, so
+the adapter divides by 1000 for its `session_time_left_s` consumer. The
+`iCurrentTime`, `iLastTime`, and `iBestTime` integer fields are milliseconds.
+ACC uses `2147483647` as the unavailable last/best lap sentinel; those values
+are returned as `null` so an uninitialized session cannot look like a lap record.
+`isValidLap` is exposed as `lap_valid` and its inverse as `invalid_lap`. Pit box
+and pit lane state are kept separate (`in_pit` and `in_pit_lane`). Global flags
+are exposed from the documented global and sector fields. Session names follow
+the ACC session enum. Pit-window timing is not exposed by these graphics pages;
+it requires the separate static page, which this adapter does not currently map.
 
 Reference documentation: Kunos' `ACCSharedMemoryDocumentationV1.8.12.pdf`,
 distributed with the ACC SDK (a public documentation mirror is at
@@ -36,11 +59,12 @@ recording; closed-back headphones are recommended.
 
 ## Required live-game checks
 
-No live ACC race or attached microphone/controller was available during adapter
-development. Unit tests exercise ABI offsets and synthetic packets, not ACC
-compatibility. Before racing, verify fuel units, session clock conversion,
-flags, pressure/temperature values, lap transitions and gaps against the HUD.
-Test paused/replay/disconnected behavior, registration/password failure, driver
-swaps, damage events and R3 press-release sequences with ACC running.
+A live Quick Race verified read-only attachment, changing speed/RPM/fuel values,
+race session type, and the 10-minute clock conversion. Unit tests exercise ABI
+offsets and synthetic packets; they do not validate every field against the
+HUD. Fuel, flags, pressure/temperature values, lap transitions and gaps still
+need HUD comparison. Paused/replay/disconnected behavior, registration/password
+failure, driver swaps, damage events and R3 press-release sequences also need
+live validation.
 Every flag/event category and crash threshold needs recorded-race validation.
 No actual game-performance or warning-latency guarantee has been established.

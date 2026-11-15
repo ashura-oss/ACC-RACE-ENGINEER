@@ -32,7 +32,31 @@ def test_stale_or_missing_context_is_unknown_without_fabrication():
 
 
 def test_tools_are_argument_free_and_whitelisted():
-    assert len(TOOL_DEFINITIONS) == 6
+    assert {t["function"]["name"] for t in TOOL_DEFINITIONS} == {
+        "get_tyre_status", "get_fuel_projection", "get_competitor_gaps", "get_recent_incidents",
+        "get_weather_forecast", "get_lap_comparison", "get_strategy_plan", "search_driver_memory"}
     assert execute("get_tyre_status", {}, {})["status"] == "unknown"
     assert execute("get_tyre_status", {"field": "secret"}, {})["status"] == "unknown"
     assert execute("execute_shell", {}, {})["status"] == "unknown"
+
+
+def test_missing_or_nonfinite_timestamps_are_not_treated_as_fresh():
+    for timestamp in (None, float("nan"), float("inf"), "not-a-time"):
+        context = {"telemetry": {"timestamp": timestamp, "fuel_l": 10},
+                   "fuel_projection": {"status": "estimated", "surplus_l": 5}}
+        tools = RaceTools(context)
+        for name in ("get_tyre_status", "get_fuel_projection", "get_competitor_gaps",
+                     "get_recent_incidents", "get_weather_forecast", "get_lap_comparison"):
+            assert tools.__getattribute__(name)()["status"] == "unknown"
+
+
+def test_empty_and_nonfinite_readings_remain_unknown():
+    tools = RaceTools({"telemetry": {"timestamp": time.time(),
+                                     "tyre_pressure_psi": [], "tyre_temp_c": [float("nan")],
+                                     "gap_ahead_s": float("inf"), "gap_behind_s": None,
+                                     "ambient_temp_c": float("nan"), "rain_intensity": None,
+                                     "last_lap_ms": True, "best_lap_ms": 90000}})
+    assert tools.get_tyre_status()["status"] == "unknown"
+    assert tools.get_competitor_gaps()["status"] == "unknown"
+    assert tools.get_weather_forecast()["status"] == "unknown"
+    assert tools.get_lap_comparison()["status"] == "unknown"

@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QScrollArea,
     QSpinBox, QSplitter, QTabWidget, QTableWidget, QTableWidgetItem,
-    QTextEdit, QVBoxLayout, QWidget,
+    QTextEdit, QVBoxLayout, QWidget, QLayout,
 )
 
 
@@ -151,6 +151,7 @@ class OverviewPage(Page):
         self.details = QLabel("—")
         self.details.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.details.setWordWrap(True)
+        self.details.setTextFormat(Qt.TextFormat.PlainText)
         details.addWidget(self.details)
         self.body.addStretch(1)
 
@@ -168,6 +169,10 @@ class OverviewPage(Page):
 
     def on_status(self):
         s = self.status; t = s.get("telemetry") or {}; age = s.get("telemetry_age_s")
+        engineer = s.get("engineer") or {}
+        last_call = engineer.get("last_call")
+        if isinstance(last_call, dict):
+            last_call = last_call.get("text") or last_call.get("response") or last_call.get("call")
         missing = (s.get("audio_readiness") or {}).get("missing_critical", [])
         self.critical_audio.setText("Critical warnings need review for this voice: " + ", ".join(missing) if missing else "")
         fresh = s.get("source") == "acc" and t.get("status") == "live" and age is not None and age < 2
@@ -179,15 +184,165 @@ class OverviewPage(Page):
             (f"Session: {t.get('session_id', '—')}    |    Data age: {age:.2f} s" if isinstance(age, (int, float)) else f"Session: {t.get('session_id', '—')}    |    Data age: —")
             + f"\nSpeed: {t.get('speed_kmh', '—')} km/h    ·    Fuel: {t.get('fuel_l', '—')} L    ·    Lap: {t.get('completed_laps', '—')}"
             + f"\nModel: {((s.get('provider') or {}).get('model', '—'))}    ·    7 day spend: ${s.get('spend_usd', 0):.4f}"
+            + (f"\nEngineer: {engineer.get('mood') or 'steady'}" +
+               (f"    ·    Last call: {last_call[:100]}" if isinstance(last_call, str) and last_call else ""))
         )
 
     def refresh(self):
         self.request("GET", "/api/status", callback=lambda d: self._status_changed(d))
 
 
+class PersonalEngineerPage(Page):
+    """Readable driver preferences, engineer state, and measured race plan."""
+    def __init__(self, api):
+        super().__init__(api, "Personal engineer", "Set how your engineer talks to you and review remembered verified sessions.")
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        inner = QWidget()
+        scroll.setWidget(inner)
+        self.body.addWidget(scroll, 1)
+        self.body = QVBoxLayout(inner)
+        self.body.setContentsMargins(0, 0, 10, 0)
+        self.body.setSpacing(12)
+        self.body.setSizeConstraint(QLayout.SizeConstraint.SetMinimumSize)
+        _, preferences = self.group("Your radio preferences")
+        form = QFormLayout()
+        self.driver_name = QLineEdit()
+        self.driver_name.setMaxLength(40)
+        self.driver_name.setMinimumHeight(36)
+        self.driver_name.setPlaceholderText("Name to use on radio")
+        self.encouragement = QComboBox()
+        self.encouragement.setMinimumHeight(36)
+        self.encouragement.addItems(["none", "brief", "high"])
+        self.profanity = QCheckBox("Allow occasional celebratory profanity")
+        self.profanity.setMinimumHeight(30)
+        self.driving_preferences = QTextEdit()
+        self.driving_preferences.setPlaceholderText("One preference per line, such as smooth inputs or late braking")
+        self.driving_preferences.setMaximumHeight(92)
+        self.driving_preferences.setMinimumHeight(80)
+        form.addRow("Driver name", self.driver_name)
+        form.addRow("Encouragement", self.encouragement)
+        form.addRow("Language", self.profanity)
+        form.addRow("Driving preferences", self.driving_preferences)
+        preferences.addLayout(form)
+        preferences.addWidget(self.button("Save preferences", self.save_preferences))
+
+        _, personal = self.group("Engineer today")
+        self.engineer_state = QLabel("Engineer status is not available yet.")
+        self.engineer_state.setTextFormat(Qt.TextFormat.PlainText)
+        self.engineer_state.setWordWrap(True)
+        personal.addWidget(self.engineer_state)
+
+        _, strategy = self.group("Measured strategy")
+        self.strategy_state = QLabel("No strategy plan available.")
+        self.strategy_state.setTextFormat(Qt.TextFormat.PlainText)
+        self.strategy_state.setWordWrap(True)
+        strategy.addWidget(self.strategy_state)
+
+        _, history = self.group("Recent verified sessions")
+        self.sessions = QLabel("No verified sessions remembered yet.")
+        self.sessions.setTextFormat(Qt.TextFormat.PlainText)
+        self.sessions.setWordWrap(True)
+        history.addWidget(self.sessions)
+        self.body.addStretch(1)
+
+    def refresh(self):
+        self.request("GET", "/api/driver/profile", callback=self._profile_loaded)
+        self.request("GET", "/api/driver/memory", callback=self._memory_loaded)
+        self.request("GET", "/api/strategy", callback=self._strategy_loaded)
+        self.request("GET", "/api/status", callback=lambda d: self._status_changed(d))
+
+    def _profile_loaded(self, data):
+        profile = data if isinstance(data, dict) else {}
+        self.driver_name.setText(str(profile.get("driver_name") or ""))
+        encouragement = profile.get("encouragement", "brief")
+        self.encouragement.setCurrentText(encouragement if encouragement in {"none", "brief", "high"} else "brief")
+        self.profanity.setChecked(profile.get("profanity") is True)
+        values = profile.get("driving_preferences") or []
+        if not isinstance(values, list):
+            values = []
+        self.driving_preferences.setPlainText("\n".join(str(value) for value in values if isinstance(value, str)))
+
+    def _memory_loaded(self, data):
+        rows = data.get("recent_sessions", []) if isinstance(data, dict) else []
+        lines = []
+        if isinstance(rows, list):
+            for row in rows[:5]:
+                if not isinstance(row, dict):
+                    continue
+                details = [str(row[key]) for key in ("track", "car") if row.get(key)]
+                if isinstance(row.get("laps"), int):
+                    details.append(f"{row['laps']} laps")
+                if isinstance(row.get("position"), int):
+                    details.append(f"P{row['position']}")
+                if details:
+                    lines.append(" · ".join(details))
+        self.sessions.setText("\n".join(lines) if lines else "No verified sessions remembered yet.")
+
+    @staticmethod
+    def _strategy_text(data):
+        if not isinstance(data, dict):
+            return "No strategy plan available."
+        plan = data.get("plan") if isinstance(data.get("plan"), dict) else data
+        status = plan.get("status", data.get("status", "measured"))
+        lines = [f"Plan: {str(status).replace('_', ' ')}"]
+        unknown = plan.get("unknown_reason") or plan.get("reason") or data.get("unknown_reason")
+        if unknown and str(status).casefold() in {"unknown", "unavailable", "insufficient_data"}:
+            lines.append("Unknown: " + str(unknown)[:220])
+        actions = plan.get("actions") or plan.get("recommendations") or []
+        if isinstance(actions, list):
+            for item in actions[:5]:
+                if isinstance(item, str):
+                    lines.append("• " + item[:200])
+                elif isinstance(item, dict):
+                    action = item.get("action") or item.get("call") or item.get("title") or item.get("recommendation")
+                    detail = item.get("reason") or item.get("rationale")
+                    if action:
+                        lines.append("• " + str(action)[:180] + (" — " + str(detail)[:180] if detail else ""))
+        limits = plan.get("limits") or data.get("limits")
+        if limits:
+            lines.append("Limits: " + str(limits)[:220])
+        if len(lines) == 1 and status == "unknown" and unknown:
+            lines.append("Unknown: " + str(unknown)[:220])
+        elif len(lines) == 1 and not unknown:
+            lines.append("No measured actions are available.")
+        return "\n".join(lines)
+
+    def _strategy_loaded(self, data):
+        self.strategy_state.setText(self._strategy_text(data))
+
+    def save_preferences(self):
+        name = self.driver_name.text().strip()
+        preferences = [line.strip() for line in self.driving_preferences.toPlainText().splitlines() if line.strip()]
+        values = {
+            "driver_name": name,
+            "encouragement": self.encouragement.currentText(),
+            "profanity": self.profanity.isChecked(),
+            "driving_preferences": preferences,
+        }
+        self.request("PUT", "/api/driver/profile", values,
+                     lambda data: self._profile_loaded(data if isinstance(data, dict) else values))
+
+    def on_status(self):
+        engineer = self.status.get("engineer") or {}
+        mood = engineer.get("mood") or "steady"
+        call = engineer.get("last_call")
+        if isinstance(call, dict):
+            call = call.get("text") or call.get("response") or call.get("summary")
+        concern = engineer.get("pending_concern")
+        if isinstance(concern, dict):
+            concern = concern.get("text") or concern.get("summary")
+        parts = [f"Engineer: {str(mood).replace('_', ' ')}"]
+        if concern and isinstance(concern, str):
+            parts.append("Concern: " + concern[:180])
+        if call and isinstance(call, str):
+            parts.append("Last call: " + call[:220])
+        self.engineer_state.setText("\n".join(parts))
+
+
 class RadioPage(Page):
     def __init__(self, api):
-        super().__init__(api, "Driver radio", "Push to talk is explicit. The microphone opens only when you start a recording.")
+        super().__init__(api, "Driver radio", "Push to talk is explicit. The microphone opens only when you start a recording. Press again to submit.")
         _, box = self.group("Radio controls")
         self.state = QLabel("Radio idle")
         self.state.setObjectName("statusCard")
@@ -196,8 +351,6 @@ class RadioPage(Page):
         row.addWidget(self.button("Toggle radio / submit", lambda: self.request("POST", "/api/radio/toggle", {}, lambda _d: self.refresh())))
         row.addWidget(self.button("Cancel recording", lambda: self.request("POST", "/api/radio/cancel", {}, lambda _d: self.refresh()), True))
         box.addLayout(row)
-        self.hint = self.status_label("Follow-up listening is disabled in this release. Press the radio button again to submit.")
-        box.addWidget(self.hint)
         self.body.addStretch(1)
 
     def on_status(self):
@@ -434,7 +587,7 @@ class ControlsPage(Page):
         self.key_combo.setCurrentText(self.settings.get("keyboard_binding", "<f9>"))
 
     def save(self):
-        values = {k: v for k, v in self.settings.items() if k in {"model", "speech_model", "voice", "weekly_budget_usd", "request_limit_usd", "speech_speed", "volume", "commentary_frequency", "radio_button", "keyboard_binding", "follow_up_listening", "recording_timeout_s", "stale_after_s", "setup_root", "setup_profiles", "thresholds", "broadcast_port", "broadcast_password", "broadcast_enabled"}}
+        values = {k: v for k, v in self.settings.items() if k in {"model", "speech_model", "voice", "weekly_budget_usd", "request_limit_usd", "speech_speed", "volume", "commentary_frequency", "radio_button", "radio_effect", "keyboard_binding", "follow_up_listening", "recording_timeout_s", "stale_after_s", "setup_root", "setup_profiles", "thresholds", "broadcast_port", "broadcast_password", "broadcast_enabled"}}
         values.update(radio_button=self.button_combo.currentText(), keyboard_binding=self.key_combo.currentText())
         self.request("PUT", "/api/settings", values, lambda _d: self.refresh())
 
@@ -448,6 +601,8 @@ class SettingsPage(Page):
         self.budget = self._number(0, 1000, .01, 5); self.limit = self._number(0, 10, .01, .1)
         self.speed = self._number(.5, 2, .05, 1); self.volume = self._number(0, 1, .05, .8)
         self.frequency = QComboBox(); self.frequency.addItems(["off", "low", "normal", "high"])
+        self.radio_effect = QComboBox(); self.radio_effect.addItems(["dry", "light", "gritty", "strong"])
+        self.follow_up_listening = QCheckBox("Listen for 5 seconds after the engineer asks a question")
         self.timeout = QSpinBox(); self.timeout.setRange(3, 30)
         self.stale = self._number(.1, 10, .1, 2)
         self.port = QSpinBox(); self.port.setRange(1024, 65535)
@@ -458,7 +613,8 @@ class SettingsPage(Page):
         self.profiles = QTextEdit(); self.profiles.setMaximumHeight(140)
         self.form.addRow("Reasoning model", self.model); self.form.addRow("Speech model", self.speech_model); self.form.addRow("Engineer voice ID", self.voice)
         self.form.addRow("Weekly budget (USD)", self.budget); self.form.addRow("Per-request limit (USD)", self.limit); self.form.addRow("Speech speed", self.speed); self.form.addRow("Playback volume", self.volume)
-        self.form.addRow("Commentary frequency", self.frequency); self.form.addRow("Recording timeout (seconds)", self.timeout); self.form.addRow("Telemetry stale threshold (seconds)", self.stale)
+        self.form.addRow("Commentary frequency", self.frequency); self.form.addRow("Radio effect", self.radio_effect); self.form.addRow("Recording timeout (seconds)", self.timeout); self.form.addRow("Telemetry stale threshold (seconds)", self.stale)
+        self.form.addRow("Follow-up listening", self.follow_up_listening)
         self.form.addRow("Broadcast port", self.port); self.form.addRow("Broadcast password", self.broadcast_password); self.form.addRow("Broadcast", self.broadcast_enabled)
         self.form.addRow("ACC setup directory", root_row); self.form.addRow("Event thresholds (JSON)", self.thresholds); self.form.addRow("Setup profiles (JSON)", self.profiles)
         buttons = QHBoxLayout(); buttons.addWidget(QPushButton("Save settings")); buttons.addWidget(QPushButton("Save OpenRouter key")); self.form.addRow("", buttons)
@@ -497,11 +653,12 @@ class SettingsPage(Page):
     def _loaded(self, data):
         self.settings = data or {}
         s = self.settings
-        for widget, key in ((self.model,"model"),(self.speech_model,"speech_model"),(self.voice,"voice"),(self.budget,"weekly_budget_usd"),(self.limit,"request_limit_usd"),(self.speed,"speech_speed"),(self.volume,"volume"),(self.frequency,"commentary_frequency"),(self.timeout,"recording_timeout_s"),(self.stale,"stale_after_s"),(self.port,"broadcast_port"),(self.setup_root,"setup_root")):
+        for widget, key in ((self.model,"model"),(self.speech_model,"speech_model"),(self.voice,"voice"),(self.budget,"weekly_budget_usd"),(self.limit,"request_limit_usd"),(self.speed,"speech_speed"),(self.volume,"volume"),(self.frequency,"commentary_frequency"),(self.radio_effect,"radio_effect"),(self.timeout,"recording_timeout_s"),(self.stale,"stale_after_s"),(self.port,"broadcast_port"),(self.setup_root,"setup_root")):
             value = s.get(key)
             if value is not None:
                 widget.setValue(value) if isinstance(widget, (QSpinBox, QDoubleSpinBox)) else widget.setCurrentText(value) if isinstance(widget, QComboBox) else widget.setText(str(value))
         self.broadcast_enabled.setChecked(bool(s.get("broadcast_enabled")))
+        self.follow_up_listening.setChecked(s.get("follow_up_listening") is True)
         self.broadcast_password.clear()
         self.thresholds.setPlainText(_pretty(s.get("thresholds", {})))
         self.profiles.setPlainText(_pretty(s.get("setup_profiles", {})))
@@ -563,7 +720,7 @@ class SettingsPage(Page):
     def _values(self):
         return {"model":self.model.text().strip(),"speech_model":self.speech_model.text().strip(),"voice":self.voice.text().strip() or DEFAULT_ENGINEER_VOICE_ID,
             "weekly_budget_usd":self.budget.value(),"request_limit_usd":self.limit.value(),"speech_speed":self.speed.value(),"volume":self.volume.value(),
-            "commentary_frequency":self.frequency.currentText(),"recording_timeout_s":self.timeout.value(),"stale_after_s":self.stale.value(),
+            "commentary_frequency":self.frequency.currentText(),"radio_effect":self.radio_effect.currentText(),"follow_up_listening":self.follow_up_listening.isChecked(),"recording_timeout_s":self.timeout.value(),"stale_after_s":self.stale.value(),
             "broadcast_port":self.port.value(),"broadcast_enabled":self.broadcast_enabled.isChecked(),"setup_root":self.setup_root.text().strip(),
             "thresholds":json.loads(self.thresholds.toPlainText() or "{}"),"setup_profiles":json.loads(self.profiles.toPlainText() or "{}"),
             "broadcast_password":self.broadcast_password.text()}
@@ -660,6 +817,7 @@ def create_pages(api):
     """Return native tab widgets keyed by labels used by the desktop shell."""
     return {
         "Overview": OverviewPage(api),
+        "Personal engineer": PersonalEngineerPage(api),
         "Radio": RadioPage(api),
         "Radio library": LibraryPage(api),
         "Live telemetry": TelemetryPage(api),

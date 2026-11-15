@@ -205,3 +205,24 @@ def test_radio_prepare_endpoint_surfaces_safe_transcription_category(tmp_path, m
         status = client.get("/api/status").json()
         assert status["radio"]["stt_state"] == "error"
         assert client.app.state.runtime.errors[-1]["message"] == "Local recognition unavailable."
+
+
+def test_directed_drama_performance_keeps_speaker_and_uses_local_tempo(tmp_path):
+    store = Store(tmp_path)
+    provider = OpenRouter(store)
+    sent = []
+    async def fake_post(model, endpoint, payload, **kwargs):
+        sent.append(payload.copy())
+        return type("Response", (), {"content": b"\0\0" * 240,
+                    "headers": {"content-type": "audio/pcm; rate=24000; channels=1"}})()
+    provider._post = fake_post
+    try:
+        asyncio.run(provider.speech("P1! Great job!", emotion="excited"))
+        asyncio.run(provider.speech("Big hit. You okay?", emotion="concerned"))
+        assert sent[0]["input"].startswith("[excited,")
+        assert sent[1]["input"].startswith("[concerned,")
+        assert sent[0]["voice"] == sent[1]["voice"] == PINNED_VOICE
+        assert sent[0]["speed"] == sent[1]["speed"] == 1.0
+    finally:
+        asyncio.run(provider.client.aclose())
+        store.close()
