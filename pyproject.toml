@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "acc-ai-race-engineer"
+version = "0.1.0"
+description = "Local-first ACC race engineer and pitwall dashboard"
+requires-python = ">=3.11"
+dependencies = ["fastapi>=0.115,<1", "uvicorn>=0.34,<1", "httpx>=0.28,<1", "keyring>=25,<26", "pydantic>=2.10,<3"]
+
+[project.optional-dependencies]
+radio = ["sounddevice>=0.5", "numpy>=2", "faster-whisper>=1.1", "pynput>=1.7"]
+vision = ["dxcam>=0.0.5; sys_platform == 'win32'", "Pillow>=11"]
+test = ["pytest>=8", "pytest-asyncio>=0.25"]
+package = ["pyinstaller>=6"]
+
+[project.scripts]
+acc-engineer = "acc_engineer.__main__:main"
+
+[tool.setuptools.package-data]
+acc_engineer = ["static/*"]
+
+[tool.setuptools.packages.find]
+include = ["acc_engineer*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
